@@ -1,8 +1,9 @@
 PYTHON ?= python3
 SWIFTC ?= swiftc
 LUA ?= lua
+RUFF ?= ruff
 
-.PHONY: bootstrap build test native-test loopback clean
+.PHONY: bootstrap build test lint native-test loopback clean
 
 bootstrap:
 	$(PYTHON) -m venv .venv
@@ -20,6 +21,9 @@ native-test: build
 test: native-test
 	$(LUA) tests/check-profile.lua
 	.venv/bin/python -m unittest discover -s tests -v
+
+lint:
+	$(RUFF) check src tests
 
 loopback: build
 	build/bridge --loopback-self-test

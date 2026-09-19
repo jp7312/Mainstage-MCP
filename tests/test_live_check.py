@@ -1,6 +1,6 @@
 """Smoke-client guard checks use a fake client, never MainStage or MIDI."""
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
 
 import live_check

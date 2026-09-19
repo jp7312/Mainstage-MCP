@@ -2,25 +2,44 @@ name: Check
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   offline:
     runs-on: macos-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.13']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
+          cache: pip
       - name: Install Lua
         run: brew install lua
       - name: Create environment
         run: make bootstrap PYTHON=python3
+      - name: Smoke test console script
+        run: .venv/bin/mainstage-mcp --version
       - name: Build native bridge
         run: make build
+      - name: Check installed dependencies
+        run: .venv/bin/python -m pip check
       - name: Run offline checks
         run: make test
+      - name: Install ruff
+        run: .venv/bin/python -m pip install ruff
+      - name: Run lint
+        run: make lint RUFF=.venv/bin/ruff
       # CoreMIDI loopback and MainStage round trips are separate local checks.

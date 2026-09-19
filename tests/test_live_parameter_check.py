@@ -1,6 +1,6 @@
 """The mapped-parameter live probe is guarded and never retries a write."""
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
 
 import live_parameter_check

@@ -4,8 +4,9 @@ import sys
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from mainstage_mcp.server import Bridge, ToolError
 from test_server import FAKE
+
+from mainstage_mcp.server import Bridge, ToolError
 
 
 class ReconnectTests(unittest.IsolatedAsyncioTestCase):
@@ -106,12 +107,12 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
                     bridge.command = [sys.executable, '-u', '-c', helper]
                     reached = asyncio.Event()
 
-                    def accept(event):
+                    def accept(event, phase=phase, real_accept=real_accept, reached=reached):
                         real_accept(event)
                         if phase != 'close' and event.get('kind') == 'hello':
                             reached.set()
 
-                    async def close(reason='bridge stopped'):
+                    async def close(reason='bridge stopped', phase=phase, real_close=real_close, reached=reached):
                         if phase == 'close' and reason == 'explicit reconnect pending':
                             reached.set()
                             await asyncio.Future()  # Hold the initial teardown until cancellation.

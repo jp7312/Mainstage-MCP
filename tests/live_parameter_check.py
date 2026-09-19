@@ -5,10 +5,9 @@ import json
 import sys
 from pathlib import Path
 
+from live_check import result_value
 from mcp.client import Client
 from mcp.client.stdio import StdioServerParameters
-
-from live_check import result_value
 
 
 def midi_value(text):
@@ -43,7 +42,8 @@ async def check(args):
                 or type(baseline.get('sequence')) is not int or baseline['sequence'] < 1
                 or type(baseline.get('rawValue')) is not int
                 or not 0 <= baseline['rawValue'] <= 127):
-            raise RuntimeError('No current mapped feedback baseline; establish the mapping and move the control manually')
+            raise RuntimeError('No current mapped feedback baseline;'
+                               ' establish the mapping and move the control manually')
         if args.value == baseline.get('rawValue'):
             raise RuntimeError('Value matches the mapped feedback baseline; choose a different value')
 
