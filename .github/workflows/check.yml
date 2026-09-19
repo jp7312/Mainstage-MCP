@@ -1,0 +1,26 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Lua
+        run: brew install lua
+      - name: Create environment
+        run: make bootstrap PYTHON=python3
+      - name: Build native bridge
+        run: make build
+      - name: Run offline checks
+        run: make test
+      # CoreMIDI loopback and MainStage round trips are separate local checks.

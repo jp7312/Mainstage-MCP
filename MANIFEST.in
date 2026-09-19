@@ -1,0 +1,4 @@
+include Makefile CONTRACT.md
+include native/bridge.swift
+recursive-include docs *.md
+recursive-include tests *.py *.lua
