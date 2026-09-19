@@ -44,6 +44,12 @@ make loopback
 
 The integrated alpha passed 35 Python tests, Lua checks, native self-test and local loopback; hosted CI runs the offline checks. Live testing was on macOS 26.4 (25E246), arm64, MainStage 4.3.1 (5233), Python 3.13 and MCP SDK 2.2.0. The workflow uses Python 3.11 on `macos-latest`; that is build/test evidence, not a second live MainStage configuration. Consult the run logs for its exact runner version.
 
+A second-Mac pass on 2026-09-19 reproduced those checks on macOS 26.6.2 (25G83), arm64, Python 3.12.13, Swift 6.3.3 and Lua 5.5.1. It also reproduced the isolated driver checks without installing the driver. The pass fixed reconnect cancellation cleanup and expired snapshot correlation, with synthetic recovery regressions and guarded live-check clients.
+
+After installing MainStage 4.3.1 (5233) from the App Store, a disposable concert passed real MCP stdio refresh and explicit helper reconnect. Separate Python/native checks passed actual owned-helper crash recovery and MainStage quit/relaunch with the same bridge process. One explicit CC90 mapping changed the visible channel volume from 0 to -18 dB, but no mapped-parameter callback arrived; that feature remains default-off. The guarded parameter client refused to call its setter without a feedback baseline. Final `make test` passed all 43 Python tests and the Lua/native checks. See [validation](VALIDATION.md) for exact evidence and the remaining gates.
+
+The 35- and 43-test totals above are historical checkpoints. The latest focused reliability pass covered installer lock recovery, malformed plist rejection and queued refresh/mutation timeouts; `make test` passed 48 Python tests in 3.659s plus the Lua harness and native parser self-test, and `pip check` passed. See [validation](VALIDATION.md) for the pass boundary.
+
 Live setup is deliberately manual: follow SETUP.md, use two dedicated IAC buses, install the owned profile, fully relaunch MainStage and open one disposable concert. Begin with `tests/live_check.py` without `--program`, which only reads/refreshes state. Never reuse endpoint IDs, profile manifests or machine paths from someone else's logs. `doctor` and `build/bridge --list` discover the local route.
 
 ## Non-negotiable behavior established by tests
@@ -51,18 +57,19 @@ Live setup is deliberately manual: follow SETUP.md, use two dedicated IAC buses,
 - `sent` is a CoreMIDI receipt, not MainStage action completion. Toggle tools always report `observed: false`; a matching selected program is weaker than proving command causality. Bank feedback is unavailable.
 - Guard mutations with fresh opaque session/revision. These are preflight checks, not an atomic host transaction or durable concert identity. Only one concert/server owner is supported.
 - Never automatically retry an ambiguous mutation, press/release or partial bank sequence. Keep partial delivery visible and require explicit reconciliation.
-- Commit snapshots atomically; keep the last complete snapshot explicitly stale during failure. A refresh proves responsiveness, not exhaustive rename notifications.
+- Commit snapshots atomically; keep the last complete snapshot explicitly stale during failure. A request that times out before acquiring the server lock leaves the active owner's snapshot transaction unchanged. A refresh proves responsiveness, not exhaustive rename notifications.
 - Reconnect only the owned helper, retain its in-process route-identity pin and invalidate old client sessions. Same-name endpoints are not necessarily the same device. Starting a new server creates a new pin.
 - Keep default-off features default-off until their individual live gates pass. Callback replay cannot count as new parameter feedback.
-- Preserve other MIDI profiles and configuration. Installer ownership is recorded and checked; it never creates IAC buses. No vendor code is shipped.
+- Preserve other MIDI profiles and configuration. Installer ownership is recorded and checked; it never creates IAC buses. Its persistent empty lock file carries kernel ownership only while held; do not delete a leftover inode. No vendor code is shipped.
+- Reject malformed XML plists through the concert-format boundary; the inspector CLI exits 2 with a concise error instead of a traceback.
 
 ## Best next experiments
 
 | Priority | Experiment | Acceptance / stop condition |
 | --- | --- | --- |
-| 1 | Reproduce setup and read-only refresh on another Mac | Record exact OS/MainStage versions, local endpoint identities and profile handshake; no compatibility claim before this passes |
-| 2 | Establish one explicit CC90 screen-control mapping | Follow PARAMETER_PROBE.md; require a genuinely newer callback, UI effect and patch-change invalidation; a timeout or capability advertisement is insufficient |
-| 3 | Complete recovery matrix | MainStage quit/relaunch, actual helper crash, unrelated topology change, changed-route refusal and sleep/wake; never replay commands |
+| 1 | Broaden the compatibility matrix | Second-Mac setup/read-only refresh passed on macOS 26.6.2, arm64, MainStage 4.3.1; Intel and other MainStage versions remain untested |
+| 2 | Obtain feedback for the explicit CC90 mapping | Mapping/UI effect passed; follow PARAMETER_PROBE.md for a genuinely newer callback, guarded setter effect and patch-change invalidation |
+| 3 | Complete recovery matrix | Host quit/relaunch and actual helper crash passed; unrelated topology change, changed-route refusal, concurrent crash/refresh and sleep/wake still need live evidence; never replay commands |
 | 4 | Validate panic separately | Controlled sustained-note scenario plus independent evidence and other-bus isolation; silence/receipt alone is insufficient |
 | 5 | Resolve isolated-driver discovery | Build isolated checks, then controlled installation and a fresh login session; inspect loading/trust evidence before changing lifecycle code |
 | 6 | Expand offline-inspector evidence | New disposable concert with a distinctive Audio Unit and explicit bus route; compare saved copies, UI and manually exported Plug-In Info; do not parse/edit opaque state yet |
@@ -72,6 +79,8 @@ Do not spend another round renaming standalone virtual ports, treating callback 
 ## Original-machine cleanup and portability
 
 Both live test rounds ended with the owned profile and temporary buses removed, diagnostic preference restored/absent, existing endpoint names and IDs compared with the recorded baseline, and test processes stopped. No driver remains installed from these tests. This describes the original machine, not a state check on a future machine.
+
+The September 19 second-Mac pass also removed its owned profile and two temporary buses, restored the original IAC offline setting and original bus IDs after IAC changed them during setup, and verified that the complete CoreMIDI inventory exactly matched its recorded baseline. MainStage remains installed; it and the test helper processes are stopped. Disposable artifacts and raw logs remain only in ignored `build/live-validation/`.
 
 Excluded intentionally: proprietary Arturia/Apple scripts, app binaries/disassembly, personal concerts, raw device IDs/logs, local manifests, credentials and generated binaries. Official source URLs and hashes are in RESEARCH.md; obtain vendor artifacts independently. Recreate the synthetic concert through MainStage using VALIDATION.md rather than transferring personal data. The isolated-driver source and its tests are now included so that investigation does not depend on the original local workspace.
 

@@ -1,6 +1,7 @@
 """Owned profile installation. Never creates, renames, or changes MIDI devices."""
 import argparse
 from contextlib import contextmanager
+import fcntl
 import hashlib
 from importlib.resources import files
 import json
@@ -138,12 +139,16 @@ def locked(state):
     state = safe_path(state)
     state.parent.mkdir(parents=True, exist_ok=True)
     lock = safe_path(str(state) + ".lock")
-    fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    # Keep one inode so contenders cannot lock different files across an unlink/reopen race.
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise OSError("Another install or uninstall is already running") from error
         yield
     finally:
         os.close(fd)
-        lock.unlink()
 
 
 def conflicts(root, manufacturer, model, owned=None, device_names=()):

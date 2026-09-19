@@ -1,6 +1,6 @@
 # Validation — 0.1.0a2 candidate
 
-Recorded 2026-09-18. The live baseline below was established with 0.1.0a1. Recovery, bank targeting, opt-in named actions, the mapped-parameter probe and offline concert inspection are 0.1.0a2 candidate changes unless a later paragraph states specific live evidence. This is a source-built developer alpha, not a full MainStage object model or a stable compatibility promise.
+Recorded 2026-09-18; second-Mac pass added 2026-09-19. The live baseline below was established with 0.1.0a1. Recovery, bank targeting, opt-in named actions, the mapped-parameter probe and offline concert inspection are 0.1.0a2 candidate changes unless a later paragraph states specific live evidence. This is a source-built developer alpha, not a full MainStage object model or a stable compatibility promise.
 
 ## Live environment
 
@@ -29,7 +29,9 @@ The live test used disposable patches named Bridge Alpha and Bridge Beta. Reprod
 
 ## Automated and independent verification
 
-The integrated candidate passes 35 Python tests, the Lua profile harness, the native parser self-test and a CoreMIDI loopback check. Coverage includes fragmented/realtime MIDI bytes, UTF-8 escaping, input and buffer bounds, atomic snapshots, connection-scoped session/revision guards, process-unique request correlation, explicit crash recovery, changed-route refusal, correlated deadlines, partial sends, cancellation, conservative installer ownership checks, default-off experimental rendering, strict per-action capability gates and exact CC80/85–87 press/release pairs. The server tests exercise real SDK stdio with a synthetic native helper, including protocol versions 2026-07-28 and 2025-11-25; those checks and the loopback are not MainStage effect evidence.
+The original integrated candidate passed 35 Python tests, the Lua profile harness, the native parser self-test and a CoreMIDI loopback check. Coverage includes fragmented/realtime MIDI bytes, UTF-8 escaping, input and buffer bounds, atomic snapshots, connection-scoped session/revision guards, process-unique request correlation, explicit crash recovery, changed-route refusal, correlated deadlines, partial sends, cancellation, conservative installer ownership checks, default-off experimental rendering, strict per-action capability gates and exact CC80/85–87 press/release pairs. The server tests exercise real SDK stdio with a synthetic native helper, including protocol versions 2026-07-28 and 2025-11-25; those checks and the loopback are not MainStage effect evidence.
+
+A final focused reliability pass on 2026-09-19 passed 48 Python tests in 3.659s, the Lua profile harness and native parser self-test; `pip check` also passed. Its installer checks cover the persistent lock inode: an unlocked pre-existing file is reusable, a separate live owner is rejected, ownership is reacquired after that process is terminated, and a lock symlink is refused. The empty inode intentionally remains; its presence alone does not indicate a running installer and it should not be deleted. Malformed XML plists produce a clean concert-format rejection, and the inspector CLI exits 2 without a traceback. A request that times out before acquiring the server lock leaves the active owner's snapshot transaction unchanged.
 
 For a read-only live smoke check after installation, omit `--program`:
 
@@ -40,9 +42,50 @@ PYTHONPATH=src .venv/bin/python tests/live_check.py \
 
 The helper refreshes and checks the exact concert name but sends no mutation by default. Each repeated `--program 0..127` is an explicit opt-in to one Program Change, for example `--program 0 --program 1`; it stops without retry if selection is not observed.
 
+### Second-Mac offline recovery pass — 2026-09-19
+
+The original 35 Python tests, Lua profile harness, native parser self-test and CoreMIDI loopback passed on macOS 26.6.2 (25G83), arm64, Python 3.12.13, MCP SDK 2.2.0, Swift 6.3.3 and Lua 5.5.1. The isolated driver build also passed its bundle-loader, ABI/routing and mock lifecycle checks; it was not installed. This initial stage supplied offline evidence; the subsequent live pass is recorded below.
+
+Recovery regressions exposed two defects: cancellation during reconnect could leave its helper running, and expired tagged snapshot replies could replace cached state. Reconnect now closes the owned helper on cancellation. Tagged snapshots require a pending refresh request before they can commit. Added synthetic checks cover cancellation during teardown/readiness/refresh, delayed replies around reconnect and requests expiring mid-snapshot, host goodbye/reinitialization, unchanged-route recovery after a topology notification, and mapped callback replay retaining its original observation time and stale connection scope. The integrated `make test` passes all 40 Python tests plus the Lua and native self-checks; `pip check` reports no broken requirements.
+
+The smoke client now accepts `--reconnect` to restart only its owned helper once, requiring fresh responsive state for the same concert and a changed nonempty session before any optional Program Changes:
+
+```sh
+PYTHONPATH=src .venv/bin/python tests/live_check.py \
+  --bridge "$PWD/build/bridge" --concert 'Exact Disposable Concert Name' --reconnect
+```
+
+Without `--program`, this sends no performance mutation. Its fake-client regression checks default refresh-only behavior, reconnect validation, fresh context for optional programs and stopping without retry. The command subsequently passed against MainStage in the live pass below.
+
+### Second-Mac live pass — 2026-09-19
+
+MainStage 4.3.1 (5233), installed from the App Store, was tested on the same macOS 26.6.2 arm64 environment. One disposable Keyboard Minimalist concert, `MCP Validation 2026-09-19`, contained the `Classic Electric Piano` patch. The owned default profile was version 2.3 / wire protocol 2. Two temporary Apple IAC buses provided the route; local endpoint identities were recorded before setup. No personal concert was edited.
+
+| Check | Observed result |
+| --- | --- |
+| Owned default profile installation and doctor | Installed successfully; dedicated buses verified |
+| Real MCP stdio refresh and `--reconnect` | Protocol 2026-07-28; fresh responsive selection/list/capabilities before and after reconnect; same concert and different nonempty client session |
+| Actual owned-helper crash | Python `Bridge` client killed only its native child; bridge/transport became unavailable and the prior session/selection remained cached and stale; one reconnect restored fresh state with a new session and the same pinned route |
+| MainStage quit/relaunch | Same Python/native bridge remained running; quitting MainStage left cached state stale and host responsiveness false; relaunching the same disposable concert restored fresh state with a new Lua/client session |
+| Explicit CC90 screen-control mapping | One raw channel-16 CC90/value-32 send changed the mapped knob and channel-strip volume from 0 to -18 dB in MainStage's accessibility state; raw tool correctly reported `observed: false` |
+| Mapped-parameter feedback | Fresh subsequent refresh still returned `mapped_parameter: null`; guarded `--value 64` probe refused before calling the setter because no current callback baseline existed |
+
+The recovery checks sent no Program Change, CC or named action. The helper-crash and host-restart checks used the Python/native bridge directly; the refresh/reconnect smoke check used real MCP stdio. Old-context rejection after a crash and concurrent crash/refresh were not separately exercised live in this pass. Neither the CC90 transport receipt nor the visible fader change establishes an audio effect or parameter acknowledgement. Manual control/hardware feedback and patch-change invalidation remain untested; see [parameter probe](PARAMETER_PROBE.md).
+
+The owned-helper crash check is reusable and read-only unless explicitly enabled:
+
+```sh
+PYTHONPATH=src .venv/bin/python tests/live_recovery_check.py \
+  --bridge "$PWD/build/bridge" --concert 'Exact Disposable Concert Name' --crash-helper
+```
+
+It checks exact concert, fresh state and a pinned route before killing its own child, reconnects once and never retries a performance mutation. Synthetic coverage also verifies its read-only default and wrong-concert refusal. `tests/live_parameter_check.py` supplies the separate guarded, one-write callback probe documented in the mapping recipe. The final integrated `make test` passed all 43 Python tests, the Lua harness and native parser self-test; `git diff --check` passed.
+
+Local evidence is in ignored `build/live-validation/`: `live-refresh-reconnect.jsonl`, `live-helper-crash.jsonl`, `host-restart.jsonl`, `raw-mapping-result.jsonl` and `live-parameter-probe.stderr`. These logs contain local context and are not distributed. Cleanup removed the owned profile and temporary buses, restored the IAC device's original offline state and original bus entity/source/destination IDs, and compared the complete CoreMIDI inventory equal to its pre-test baseline. MainStage and the test helpers were stopped; MainStage remains installed. No custom driver, global MIDI restart or logout was used.
+
 ## Recovery live validation recipe
 
-The combined candidate passed one helper-restart case: `mainstage_reconnect` stopped and restarted its owned native helper, restored a responsive snapshot on the same pinned route, returned a different opaque client session, and rejected the held pre-reconnect session before any MIDI send. The remaining cases below are still acceptance recipes rather than completed evidence.
+The original-machine combined candidate passed one helper-restart case: `mainstage_reconnect` stopped and restarted its owned native helper, restored a responsive snapshot on the same pinned route, returned a different opaque client session, and rejected the held pre-reconnect session before any MIDI send. The September 19 pass above additionally completed host quit/relaunch and actual helper-crash recovery. The list below retains the complete recipe; its other cases and the post-crash old-context mutation check remain pending live evidence.
 
 For the unchecked steps, use the disposable one-concert setup above and record the exact macOS/MainStage versions and endpoint listing before and after each case.
 
@@ -68,7 +111,7 @@ Promote one capability at a time only after its effect, reverse/restoration beha
 
 ## Experimental mapped-parameter live result
 
-The combined profile advertised the opt-in CC90 slot, but no explicit MainStage screen-control mapping was established. One unmapped write of value 32 returned `sent: true`, `observed: false`, and `timed_out: true`, leaving cached state explicitly stale. A subsequent refresh returned healthy responsive state with `mapped_parameter: null`. This validates conservative ambiguity and recovery handling, not parameter feedback or a plug-in effect. The probe remains default-off; follow [the mapping recipe](PARAMETER_PROBE.md) before making any stronger claim.
+On September 18, the combined profile advertised the opt-in CC90 slot, but no explicit MainStage screen-control mapping was established. One unmapped write of value 32 returned `sent: true`, `observed: false`, and `timed_out: true`, leaving cached state explicitly stale. A subsequent refresh returned healthy responsive state with `mapped_parameter: null`. This validates conservative ambiguity and recovery handling. September 19 added the explicit mapping and raw-CC UI effect recorded above, but still no parameter callback. The probe remains default-off; follow [the mapping recipe](PARAMETER_PROBE.md) before making any stronger claim.
 
 Independent implementation reviews and additional adversarial checks found no unresolved blockers within this implemented scope. The 0.1.0a1 baseline was built as an sdist and a wheel built from that sdist; the source distribution includes Swift, Makefile, Lua checks and documentation, while the wheel includes the Lua profile. Users still build the native executable separately. The same source-distribution and wheel content checks are part of the 0.1.0a2 packaging workflow.
 
@@ -81,7 +124,7 @@ Independent implementation reviews and additional adversarial checks found no un
 - Adding/removing IAC buses regenerated pre-existing endpoint IDs on this machine. Test cleanup restored the recorded endpoint IDs. The distributed installer never edits MIDI configuration; manual setup remains an explicit limitation.
 - Session/revision guards are preflight checks, not atomic host transactions. A user can switch context between checking state and MIDI execution. The exposed session is connection-scoped; neither it nor concert names are durable concert identities.
 
-The recovery recipe above, second-machine installation, Intel execution, other MainStage/macOS versions, multiple concerts, sleep/wake, sustained load and signed distribution remain unverified. Bounds are tested synthetically; a large live concert was not tested. Update 2026-09-19: the initial published commit's [hosted offline CI run passed](https://github.com/jp7312/Mainstage-MCP/actions/runs/35414789330). This does not establish live MainStage compatibility on the runner.
+The unchecked recovery cases above, Intel execution, MainStage versions other than 4.3.1, macOS versions beyond the two recorded builds, multiple concerts, sleep/wake, sustained load and signed distribution remain unverified. Bounds are tested synthetically; a large live concert was not tested. Update 2026-09-19: the initial published commit's [hosted offline CI run passed](https://github.com/jp7312/Mainstage-MCP/actions/runs/35414789330). This does not establish live MainStage compatibility on the runner.
 
 One refresh timed out after routing changes while entering Perform mode and recovered only after a full MainStage relaunch; that sequence does not isolate the cause. A later fresh Perform-mode refresh and bank/program selection succeeded, ruling out a general claim that Perform mode is unsupported.
 

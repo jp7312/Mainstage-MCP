@@ -15,7 +15,8 @@ def main(argv=None):
         return 0
     if args[0] == "serve":
         from .server import main as serve
-        return serve(args[1:])
+        result = serve(args[1:])
+        return 0 if result is None else result
     if args[0] in ("install", "uninstall", "doctor"):
         from .installation import main as setup
         return setup(args)

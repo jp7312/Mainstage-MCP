@@ -36,7 +36,7 @@ def _plist(path: Path, budget: list[int]) -> dict[str, Any]:
     budget[0] -= len(data)
     try:
         value = plistlib.loads(data)
-    except plistlib.InvalidFileException as error:
+    except Exception as error:
         raise ConcertFormatError(f"invalid plist: {path.name}") from error
     if not isinstance(value, dict):
         raise ConcertFormatError(f"plist root must be a dictionary: {path.name}")
