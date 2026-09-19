@@ -1,5 +1,7 @@
 """Installer checks use isolated directories and fake read-only bridge output."""
+from contextlib import redirect_stdout
 import copy
+import io
 import json
 import multiprocessing
 from pathlib import Path
@@ -73,10 +75,10 @@ class InstallationTests(unittest.TestCase):
         self.assertIn("local actions = false", target.read_text())
 
     def test_existing_conflict_is_untouched(self):
-        target = self.root / "Apple Inc." / "Sterownik IAC.device" / "config.lua"
+        target = self.root / "Apple Inc" / "Sterownik IAC.device" / "config.lua"
         target.parent.mkdir(parents=True)
         target.write_text("original")
-        with self.assertRaisesRegex(ValueError, "Conflicting"):
+        with self.assertRaisesRegex(ValueError, r"Conflicting profile file: .+config\.lua"):
             setup.install(**self.options)
         self.assertEqual(target.read_text(), "original")
         self.assertFalse(self.state.exists())
@@ -140,6 +142,7 @@ class InstallationTests(unittest.TestCase):
             setup.install(**self.options)
         self.assertFalse(list(self.root.rglob("config.lua")))
         self.assertFalse(self.state.exists())
+        self.assertEqual(list(self.root.iterdir()), [])
 
     def test_identity_change_after_install_is_reported(self):
         setup.install(**self.options)
@@ -162,6 +165,81 @@ class InstallationTests(unittest.TestCase):
                 setup.install(**self.options)
         self.assertFalse(list(self.root.rglob("config.lua")))
         self.assertFalse(self.state.exists())
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_crash_orphan_with_identical_bytes_is_adopted(self):
+        manufacturer, model = setup.select_device(rows(), "MS Bridge Input", "MS Bridge Output")
+        target = self.root / manufacturer / (model + ".device") / "config.lua"
+        target.parent.mkdir(parents=True)
+        data = setup.render(self.template, "MS Bridge Input", "MS Bridge Output", manufacturer, model)
+        target.write_bytes(data)
+        setup.install(**self.options)
+        manifest = json.loads(self.state.read_text())
+        self.assertEqual(manifest["file"], str(target))
+        self.assertEqual(manifest["sha256"], setup.digest(data))
+        self.assertFalse(setup.install(**self.options)["changed"])
+
+    def test_crash_orphan_with_foreign_bytes_names_config(self):
+        target = self.root / "Apple Inc" / "Sterownik IAC.device" / "config.lua"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"someone else")
+        with self.assertRaisesRegex(ValueError, r"config\.lua"):
+            setup.install(**self.options)
+        self.assertEqual(target.read_bytes(), b"someone else")
+        self.assertFalse(self.state.exists())
+
+    def test_corrupt_manifest_error_names_file_for_both_commands(self):
+        self.state.parent.mkdir(parents=True)
+        self.state.write_text("{not json")
+        with self.assertRaisesRegex(ValueError, "installation.json"):
+            setup.uninstall(self.state, self.root)
+        for command, argv in (
+                ("install", ["install", "--bridge", str(self.options["bridge"]), "--profile-root", str(self.root),
+                             "--state", str(self.state), "--template", str(self.template)]),
+                ("uninstall", ["uninstall", "--profile-root", str(self.root), "--state", str(self.state)])):
+            with self.subTest(command=command):
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    self.assertEqual(setup.main(argv), 1)
+                self.assertIn("installation.json", buffer.getvalue())
+                self.assertIn("remove", buffer.getvalue())
+
+    def test_manifest_schema_violations_name_the_field(self):
+        setup.install(**self.options)
+        good = json.loads(self.state.read_text())
+        cases = [(field, {key: value for key, value in good.items() if key != field})
+                 for field in ("version", "profile_root", "file", "input", "output", "endpoints", "sha256")]
+        cases += [("input", {**good, "input": "  "}), ("sha256", {**good, "sha256": good["sha256"].upper()}),
+                  ("endpoints", {**good, "endpoints": [{"direction": "source"}]}),
+                  ("version", {**good, "version": True}), ("installation.json", "{")]
+        for expected, manifest in cases:
+            with self.subTest(expected=expected):
+                self.state.write_text(manifest if isinstance(manifest, str) else json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, expected):
+                    setup.uninstall(self.state, self.root)
+
+    def test_lock_file_permissions_are_tightened(self):
+        self.state.parent.mkdir(parents=True)
+        lock = Path(str(self.state) + ".lock")
+        lock.touch(mode=0o644)
+        with setup.locked(self.state):
+            self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+
+    def test_symlinked_system_profile_root_is_skipped(self):
+        real = self.base / "system-profiles"
+        (real / "Apple Inc." / "Sterownik IAC.device").mkdir(parents=True)
+        linked = self.base / "linked-system-profiles"
+        linked.symlink_to(real, target_is_directory=True)
+        target = self.root / "Apple Inc" / "Sterownik IAC.device" / "config.lua"
+        with patch.object(setup, "SYSTEM_PROFILE_ROOTS", (linked,)):
+            self.assertEqual(setup.conflicts(self.root, "Apple Inc.", "Sterownik IAC"), [])
+            self.assertTrue(setup.install(**self.options)["installed"])
+        with patch.object(setup, "SYSTEM_PROFILE_ROOTS", (real,)):
+            self.assertEqual(setup.conflicts(self.root, "Apple Inc.", "Sterownik IAC", target),
+                             [str(real / "Apple Inc." / "Sterownik IAC.device")])
+            with self.assertRaisesRegex(ValueError, "Conflicting"):
+                setup.install(**self.options)
 
     def test_wrong_driver_duplicate_or_different_device(self):
         for field, value in (("driver_owner", "untrusted"), ("device_unique_id", 999), ("entity", 0),
