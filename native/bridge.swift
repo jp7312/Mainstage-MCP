@@ -4,6 +4,10 @@ import Darwin
 
 // MIDI 1.0 packet APIs match MainStage's Lua byte tables. All limits include wire bytes.
 let maximumFrame = 65536
+// Stdin lines (commands and --decode-hex) share the contract's 4096-byte command bound.
+let maximumLine = 4096
+// One legal maximum Lua snapshot (profile MAX_TOTAL 4194304) must fit the stdout backlog.
+let maximumBacklog = 4 * 1024 * 1024
 let receiveQueue = DispatchQueue(label: "mainstage.mcp.receive")
 let outputQueue = DispatchQueue(label: "mainstage.mcp.stdout")
 let outputLock = NSLock()
@@ -14,10 +18,11 @@ func json(_ object: Any) {
     guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { fatal("JSON serialization failed") }
     outputLock.lock()
     pendingOutput += data.count + 1
-    let overflow = pendingOutput > 1048576
+    let overflow = pendingOutput > maximumBacklog
     outputLock.unlock()
-    // ponytail: bounded 1 MiB stdout backlog; a stalled consumer loses the transport by process exit.
-    if overflow { fatal("Transport disconnected: stdout backlog exceeded 1 MiB") }
+    // ponytail: bounded 4 MiB stdout backlog; absorbs a legal maximum snapshot while the consumer
+    // briefly stalls; a truly stalled consumer still loses the transport by process exit.
+    if overflow { fatal("Transport disconnected: stdout backlog exceeded 4 MiB") }
     outputQueue.async {
         do { try FileHandle.standardOutput.write(contentsOf: data + Data([10])) }
         catch { fatal("Transport disconnected: stdout write failed") }
@@ -51,6 +56,9 @@ struct SysExParser {
         }
     }
 }
+// Decode-hex EOF edge: a capture cut off before even the MSP2 marker byte is invalid input,
+// not a partial message; truncation after 7D stays tolerable for dev inspection.
+func decodableTail(_ pending: [UInt8]?) -> Bool { pending == nil || pending?.first == 0x7D }
 struct Command { let id: String; let bytes: [UInt8]; let quit: Bool }
 func token(_ value: Any?) -> String? {
     guard let text = value as? String, (1...64).contains(text.utf8.count),
@@ -58,7 +66,7 @@ func token(_ value: Any?) -> String? {
     return text
 }
 func command(_ data: Data) -> Command? {
-    guard data.count <= 4096, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+    guard data.count <= maximumLine, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let id = token(object["id"]), let name = object["command"] as? String else { return nil }
     func integer(_ key: String, _ range: ClosedRange<Int>) -> UInt8? {
         guard let value = object[key] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
@@ -77,6 +85,59 @@ func command(_ data: Data) -> Command? {
         return Command(id: id, bytes: [0xB0 | (channel - 1), control, value], quit: false)
     default: return nil
     }
+}
+func hexByte(_ text: String) -> UInt8? {
+    func value(_ digit: UInt8) -> UInt8? {
+        switch digit {
+        case 48...57: return digit - 48
+        case 65...70: return digit - 55
+        case 97...102: return digit - 87
+        default: return nil
+        }
+    }
+    let digits = Array(text.utf8)
+    guard digits.count == 2, let high = value(digits[0]), let low = value(digits[1]) else { return nil }
+    return high << 4 | low
+}
+// Bounded stdin line reader shared by the command loop and --decode-hex; unlike readLine(),
+// it never buffers more than maximumLine bytes.
+struct LineReader {
+    var line = Data()
+    var oversized = false
+    // Returns true when byte terminates a line; oversized lines drain without buffering.
+    mutating func accept(_ byte: UInt8) -> Bool {
+        if byte != 10 {
+            if line.count < maximumLine { line.append(byte) } else { oversized = true }
+            return false
+        }
+        return true
+    }
+    mutating func reset() { line.removeAll(keepingCapacity: true); oversized = false }
+}
+func readByte() -> UInt8? {
+    while true {
+        var byte: UInt8 = 0
+        let count = Darwin.read(STDIN_FILENO, &byte, 1)
+        if count < 0 && errno == EINTR { continue }
+        if count <= 0 { return nil }
+        return byte
+    }
+}
+// Feeds each newline-terminated line — plus a trailing unterminated line at EOF — through consume;
+// consume returns false to stop reading early (quit). Oversized lines pass the drain flag instead
+// of their contents.
+func readLines(_ consume: (Data, Bool) -> Bool) {
+    var reader = LineReader()
+    var stopped = false
+    while !stopped {
+        guard let byte = readByte() else { break }
+        guard reader.accept(byte) else { continue }
+        stopped = !consume(reader.line, reader.oversized)
+        reader.reset()
+    }
+    guard !stopped, !reader.line.isEmpty || reader.oversized else { return }
+    _ = consume(reader.line, reader.oversized)
+    reader.reset()
 }
 func stringProperty(_ object: MIDIObjectRef, _ property: CFString) -> String {
     var value: Unmanaged<CFString>?
@@ -112,6 +173,12 @@ func routeIdentity(_ info: [String: Any]) -> [Any] {
     [info["direction"]!, info["name"]!, info["unique_id"]!, info["entity_unique_id"]!,
      info["device_unique_id"]!, info["driver_owner"]!]
 }
+func usableRoute(_ info: [String: Any]) -> Bool {
+    // An endpoint that vanished mid-enumeration reports no names and unique_id 0; emitting it would
+    // masquerade as a MIDI configuration change in downstream identity digesting.
+    let name = info["name"] as? String ?? "", display = info["display_name"] as? String ?? ""
+    return !(name.isEmpty && display.isEmpty) || (info["unique_id"] as? Int32 ?? 0) != 0
+}
 func check(_ status: OSStatus, _ operation: String) {
     if status != noErr { fatal("\(operation) failed (CoreMIDI \(status))") }
 }
@@ -146,7 +213,30 @@ func selfTest() {
     precondition(parse("{\"id\":\"x\",\"command\":\"refresh\"}")?.bytes == [0xF0,0x7D] + Array("MSP2\trefresh\tx".utf8) + [0xF7])
     for text in ["", "[]", "{}", "{\"id\":\"bad id\",\"command\":\"quit\"}", "{\"id\":\"x\",\"command\":\"quit\",\"extra\":1}"] { precondition(parse(text) == nil) }
     precondition(command(Data(repeating: 32, count: 4097)) == nil)
-    json(["self_test":"passed", "checks":"fragmentation, realtime, unicode, malformed input, frame bound, strict commands, correlation"])
+    // Backlog cap absorbs one legal maximum Lua snapshot before fataling on a stalled consumer.
+    precondition(maximumBacklog == 4 * 1024 * 1024 && maximumBacklog >= 4194304)
+    // --decode-hex tokens require exactly two hex digits.
+    for (text, byte) in [("7d", UInt8(0x7D)), ("F0", UInt8(0xF0)), ("ab", UInt8(0xAB))] { precondition(hexByte(text) == byte) }
+    for text in ["f", "7", "7dd", "0x7d", "+f", "-f", " f", "7d ", "", "zz"] { precondition(hexByte(text) == nil) }
+    // A capture ending before the MSP2 marker byte is rejected; 7D-prefixed truncation is not.
+    precondition(decodableTail(nil) && decodableTail([0x7D, 0x4D]))
+    precondition(!decodableTail([]) && !decodableTail([0x41, 0x06]))
+    // Line reader stays bounded and flags oversized lines instead of buffering past maximumLine.
+    var reader = LineReader()
+    for byte in Array("ok".utf8) { precondition(!reader.accept(byte)) }
+    precondition(reader.accept(10) && reader.line == Data("ok".utf8) && !reader.oversized)
+    reader.reset()
+    precondition(reader.line.isEmpty && !reader.oversized)
+    for _ in 0..<maximumLine + 64 { precondition(!reader.accept(65)) }
+    precondition(reader.oversized && reader.line.count == maximumLine)
+    precondition(reader.accept(10))
+    // Rows from endpoints that vanished mid-enumeration never reach identity digesting.
+    precondition(!usableRoute(["name": "", "display_name": "", "unique_id": Int32(0)] as [String: Any]))
+    let surviving: [[String: Any]] = [["name": "Bus", "display_name": "", "unique_id": Int32(0)],
+                                      ["name": "", "display_name": "Bus", "unique_id": Int32(0)],
+                                      ["name": "", "display_name": "", "unique_id": Int32(7)]]
+    for info in surviving { precondition(usableRoute(info)) }
+    json(["self_test":"passed", "checks":"fragmentation, realtime, unicode, malformed input, frame bound, strict commands, correlation, snapshot backlog, hex tokens, bounded lines, list rows"])
 }
 
 func run() {
@@ -154,12 +244,15 @@ func run() {
     if args == ["--self-test"] { selfTest(); return }
     if args == ["--decode-hex"] {
         var parser = SysExParser()
-        while let line = readLine() {
-            let parts = line.split(whereSeparator: { $0.isWhitespace })
-            let bytes = parts.compactMap { UInt8($0, radix: 16) }
+        readLines { line, oversized in
+            guard !oversized else { fatal("Invalid hex input") }
+            let parts = String(decoding: line, as: UTF8.self).split(whereSeparator: { $0.isWhitespace })
+            let bytes = parts.compactMap { hexByte(String($0)) }
             guard bytes.count == parts.count else { fatal("Invalid hex input") }
             parser.feed(bytes, emit: json)
+            return true
         }
+        guard decodableTail(parser.pending) else { fatal("Invalid hex input") }
         return
     }
     let loopback = args == ["--loopback-self-test"]
@@ -176,8 +269,14 @@ func run() {
     }, "Create MIDI client")
     defer { MIDIClientDispose(client) }
     if args == ["--list"] {
-        for index in 0..<MIDIGetNumberOfSources() { json(endpointInfo(MIDIGetSource(index), direction:"source")) }
-        for index in 0..<MIDIGetNumberOfDestinations() { json(endpointInfo(MIDIGetDestination(index), direction:"destination")) }
+        for index in 0..<MIDIGetNumberOfSources() {
+            let info = endpointInfo(MIDIGetSource(index), direction: "source")
+            if usableRoute(info) { json(info) }
+        }
+        for index in 0..<MIDIGetNumberOfDestinations() {
+            let info = endpointInfo(MIDIGetDestination(index), direction: "destination")
+            if usableRoute(info) { json(info) }
+        }
         return
     }
     var parser = SysExParser(); let receiveSlots = DispatchSemaphore(value: 64)
@@ -239,24 +338,15 @@ func run() {
     routeLock.lock(); connected = true; routeLock.unlock()
     json(["kind":"transport", "connected":true, "reason":"Verified IAC endpoint pair connected",
           "route":[routeIdentity(first), routeIdentity(second)]])
-    // Read bounded bytes instead of readLine(), which allocates arbitrarily large lines.
-    var line = Data(); var oversized = false
-    while true {
-        var byte: UInt8 = 0
-        let count = Darwin.read(STDIN_FILENO, &byte, 1)
-        if count < 0 && errno == EINTR { continue }
-        if count <= 0 { break }
-        if byte != 10 {
-            if line.count < 4096 { line.append(byte) } else { oversized = true }
-            continue
-        }
-        defer { line.removeAll(keepingCapacity:true); oversized = false }
+    // Bounded reader with the same line discipline for every input, including a trailing
+    // unterminated line at EOF, which still gets one validate/parse pass.
+    readLines { line, oversized in
         guard !oversized, let request = command(line) else {
             let object = (try? JSONSerialization.jsonObject(with:line)) as? [String:Any]
             json(["kind":"command_result", "id":token(object?["id"]) ?? "", "ok":false, "status":-50, "error":"Invalid command (4096-byte limit; strict JSON fields and integer ranges)"])
-            continue
+            return true
         }
-        if request.quit { json(["kind":"command_result", "id":request.id, "ok":true, "status":0]); break }
+        if request.quit { json(["kind":"command_result", "id":request.id, "ok":true, "status":0]); return false }
         routeLock.lock()
         if connected && (!NSDictionary(dictionary:first).isEqual(to:endpointInfo(destination,direction:"destination")) || !NSDictionary(dictionary:second).isEqual(to:endpointInfo(source,direction:"source"))) {
             connected = false
@@ -267,6 +357,7 @@ func run() {
         var result: [String:Any] = ["kind":"command_result", "id":request.id, "ok":status == 0, "status":status]
         if status != 0 { result["error"] = "MIDI send failed or transport disconnected" }
         json(result)
+        return true
     }
     receiveQueue.sync {}
 }
