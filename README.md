@@ -2,6 +2,8 @@
 
 Source-built developer alpha for local MainStage inspection and MIDI control through MCP. A Python stdio server owns a Swift/CoreMIDI bridge; an original Lua device profile reports MainStage selection and patch/set information.
 
+Continuing development on another machine? Start with the [agent handoff](docs/HANDOFF.md) and [consolidated research findings](docs/RESEARCH.md), including failed experiments and the next live-test gates.
+
 **Validation:** the 0.1.0a1 baseline passed a live MCP stdio round trip on MainStage 4.3.1 with one original test concert: profile handshake, selection/list feedback, assigned Program Changes and the metronome binding, including other-bus isolation. The 0.1.0a2 candidate adds the features below. Same-program/different-bank targeting, explicit helper reconnect and two experimental action bindings have narrow live evidence; mapped-parameter feedback and concert inspection remain offline checked unless the validation document records a later result. This is not a compatibility matrix. No stable-release, signing, notarization, or cross-machine compatibility claim is made.
 
 ## Scope

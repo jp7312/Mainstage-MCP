@@ -46,4 +46,4 @@ Bank/program selection is standard outbound MIDI and has no profile capability f
 
 ## Release gates
 
-Original source only. No vendor scripts, binaries/disassembly, user concerts, machine-specific logs or absolute user paths. Installation must preserve other profiles and MIDI configuration, be owned/idempotent/reversible, and detect conflicts. An installation requiring manual dedicated buses must document that constraint honestly. No public GitHub/network publication in this task.
+Original source only. No vendor scripts, binaries/disassembly, user concerts, machine-specific logs or absolute user paths. Installation must preserve other profiles and MIDI configuration, be owned/idempotent/reversible, and detect conflicts. An installation requiring manual dedicated buses must document that constraint honestly. The alpha source is public; experimental sources remain explicitly outside the supported package and default build.

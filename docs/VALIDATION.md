@@ -77,11 +77,11 @@ Independent implementation reviews and additional adversarial checks found no un
 - A MIDI rescan did not reliably restore profile feedback; fully quitting/relaunching MainStage with one concert did. Multiple concerts and profile reload behavior were not isolated experimentally.
 - A selector experiment reached a patch inside a set, but callback indices did not reliably address patches outside sets. That selector is not enabled or exposed.
 - Controller feedback did not reliably represent metronome state. The mapped-parameter probe exposes no live feedback evidence yet, and no action-state API is exposed.
-- A separate original CoreMIDI driver prototype compiled and passed synthetic checks but was not discovered after rescan or CoreMIDI restart. It was removed and is excluded from this release.
+- A separate original CoreMIDI driver prototype compiled and passed synthetic checks but was not discovered after rescan or CoreMIDI restart. It was removed. Its source is now preserved under [experiments/isolated-driver](../experiments/isolated-driver/README.md), outside the supported package and default build; no driver binary is distributed.
 - Adding/removing IAC buses regenerated pre-existing endpoint IDs on this machine. Test cleanup restored the recorded endpoint IDs. The distributed installer never edits MIDI configuration; manual setup remains an explicit limitation.
 - Session/revision guards are preflight checks, not atomic host transactions. A user can switch context between checking state and MIDI execution. The exposed session is connection-scoped; neither it nor concert names are durable concert identities.
 
-The recovery recipe above, second-machine installation, Intel execution, other MainStage/macOS versions, multiple concerts, sleep/wake, sustained load, signed distribution and hosted CI execution remain unverified. Bounds are tested synthetically; a large live concert was not tested.
+The recovery recipe above, second-machine installation, Intel execution, other MainStage/macOS versions, multiple concerts, sleep/wake, sustained load and signed distribution remain unverified. Bounds are tested synthetically; a large live concert was not tested. Update 2026-09-19: the initial published commit's [hosted offline CI run passed](https://github.com/jp7312/Mainstage-MCP/actions/runs/35414789330). This does not establish live MainStage compatibility on the runner.
 
 One refresh timed out after routing changes while entering Perform mode and recovered only after a full MainStage relaunch; that sequence does not isolate the cause. A later fresh Perform-mode refresh and bank/program selection succeeded, ruling out a general claim that Perform mode is unsupported.
 
