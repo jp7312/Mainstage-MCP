@@ -58,6 +58,8 @@ def _boolean(value: Any, field: str) -> bool:
 def _text(value: Any, field: str, *, empty: bool = False) -> str:
     if not isinstance(value, str) or len(value) > 1024 or (not empty and not value):
         raise ConcertFormatError(f"invalid {field}")
+    if "\x00" in value:
+        raise ConcertFormatError(f"{field} contains NUL")
     return value
 
 
@@ -101,7 +103,7 @@ def _channel(value: Any, node_dir: Path) -> dict[str, Any]:
 
 def inspect_concert(path: str | Path) -> dict[str, Any]:
     root = Path(path)
-    if root.is_symlink() or not root.is_dir() or root.suffix != ".concert":
+    if root.is_symlink() or not root.is_dir() or root.suffix.lower() != ".concert":
         raise ConcertFormatError("expected a non-symlink .concert directory")
     budget = [MAX_TOTAL_PLIST_BYTES]
     document = _plist(root / "data.plist", budget)
@@ -172,7 +174,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         print(json.dumps(inspect_concert(args.concert), ensure_ascii=False, indent=2))
-    except ConcertFormatError as error:
+    except (ConcertFormatError, ValueError, OSError) as error:
         parser.exit(2, f"concert-inspector: {error}\n")
     return 0
 
