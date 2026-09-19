@@ -4,24 +4,37 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mainstage-mcp"
-version = "0.1.0a2"
 description = "Local MCP access to MainStage through CoreMIDI and a small controller profile"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
+authors = [{name = "jp", email = "v8wkjj49vh@privaterelay.appleid.com"}]
+keywords = ["mainstage", "midi", "mcp", "coremidi", "macos"]
 dependencies = ["mcp==2.2.0"]
+dynamic = ["version"]
 classifiers = [
   "Development Status :: 3 - Alpha",
+  "Environment :: MacOS X",
   "Operating System :: MacOS :: MacOS X",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Multimedia :: Sound/Audio :: MIDI",
 ]
+
+[project.urls]
+Homepage = "https://github.com/jp7312/Mainstage-MCP"
+Issues = "https://github.com/jp7312/Mainstage-MCP/issues"
 
 [project.scripts]
 mainstage-mcp = "mainstage_mcp.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "mainstage_mcp.__version__"}
 
 [tool.setuptools.package-data]
 mainstage_mcp = ["profile.lua"]

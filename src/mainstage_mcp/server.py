@@ -15,6 +15,8 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, Field, StrictInt
 
+from mainstage_mcp import __version__
+
 MidiByte = Annotated[StrictInt, Field(ge=0, le=127)]
 Channel = Annotated[StrictInt, Field(ge=1, le=16)]
 Revision = Annotated[StrictInt, Field(ge=0)]
@@ -564,7 +566,7 @@ def create_server(bridge: Bridge) -> MCPServer:
         finally:
             await bridge.close()
 
-    server = MCPServer('MainStage MCP', version='0.1.0a2', lifespan=lifespan)
+    server = MCPServer('MainStage MCP', version=__version__, lifespan=lifespan)
 
     @server.tool(annotations={'readOnlyHint': True})
     async def mainstage_get_state() -> State:
