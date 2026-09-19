@@ -90,6 +90,7 @@ local function rejected(items, patch)
     local recovered = select()
     assert(#recovered == 6 and decode(recovered[1])[2] == 'snapshot_begin')
     assert(decode(refresh('recovered')[2])[2] == 'snapshot_begin')
+    return decode(result[1])[4]
 end
 rejected({[2] = list[1]})
 rejected({{IsPatch = 'yes', SetIndex = 0, PatchIndex = 0, Label = 'bad'}})
@@ -97,6 +98,20 @@ rejected(list, string.rep('%', 23000))
 local huge = {}; for i = 1, 4097 do huge[i] = list[1] end; rejected(huge)
 local big = {}; for i = 1, 4096 do big[i] = {IsPatch = true, SetIndex = 0, PatchIndex = i, Label = string.rep('x', 1100)} end
 rejected(big)
+-- Swift drops frames whose percent-decoded bytes are not valid UTF-8, so the profile
+-- must reject such snapshots instead of committing frames the bridge would swallow.
+assert(rejected(list, string.char(0xC3, 0x28) .. 'Latin-1 Patch') == 'invalid_snapshot')
+assert(rejected({{IsPatch = true, SetIndex = 0, PatchIndex = 0,
+    Label = string.char(0xED, 0xA0, 0x80)}}) == 'invalid_snapshot') -- surrogate D800
+assert(decode(refresh('utf8_survivor')[3])[8] == 'Żółć 🎹\t%\n') -- last good snapshot survives
+assert(#select() == 0)
+-- Frame boundary: 65533 payload bytes make exactly a 65536-byte frame; one more fails.
+local maxPatch = string.rep('x', 65500)
+local maxed = controller_select_patch(0, maxPatch, 'Set', 'Concert',
+    {{IsPatch = true, SetIndex = 0, PatchIndex = 0, Label = 'Only'}}, 0, 0).midi
+assert(#maxed[2] == 65536 and decode(maxed[2])[8] == maxPatch)
+assert(#refresh('max_frame')[3] == 65536)
+assert(rejected(list, string.rep('x', 65501)) == 'snapshot_limit')
 assert(controller_midi_out({[0] = 0xBF, [1] = 91, [2] = 64}, 'Other', '64', nil) == nil)
 local callback = controller_midi_out({[0] = 0xBF, [1] = 90, [2] = 90}, 'Cutoff', '1.2 kHz', nil)
 local value = decode(callback.midi)
@@ -116,7 +131,7 @@ assert(#controller_timer_trigger().midi == 0)
 local nextSession = decode(controller_initialize('MainStage', false).midi[1])[5]
 assert(session ~= nextSession)
 assert(decode(refresh('new_session')[2])[4] == 'no_snapshot')
-print('profile checks passed: zero, Unicode, duplicates, revisions, correlation, sessions, pass-through, malformed input, bounds')
+print('profile checks passed: zero, Unicode, duplicates, revisions, correlation, sessions, pass-through, malformed input, bounds, utf8 rejection, frame boundary')
 
 f = assert(io.open('src/mainstage_mcp/profile.lua', 'rb'))
 local experimentalSource = f:read('*a'); f:close()
