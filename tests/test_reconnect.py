@@ -46,6 +46,46 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge.reason, 'refresh failed or timed out')
         self.assertIsNone(bridge.responsive_clock)
 
+    async def test_refresh_failure_invalidates_with_the_specific_error(self):
+        bridge = Bridge(['unused'])
+        bridge.stale, bridge.reason, bridge.responsive_clock = False, None, 1.0
+
+        async def failing_send(command):
+            raise ValueError('MIDI send failed: helper stdin closed')
+
+        with patch.object(bridge, 'send', side_effect=failing_send):
+            with self.assertRaises(ToolError) as failed:
+                await bridge.refresh()
+        self.assertEqual(str(failed.exception), 'MIDI send failed: helper stdin closed')
+        self.assertTrue(bridge.stale)
+        self.assertEqual(bridge.snapshot().reason, 'MIDI send failed: helper stdin closed')
+        self.assertIsNone(bridge.responsive_clock)
+
+    async def test_close_tears_down_when_helper_and_reader_misbehave(self):
+        class StubProcess:
+            def __init__(self):
+                self.returncode = None
+            def terminate(self):
+                pass
+            def kill(self):
+                pass
+            async def wait(self):
+                await asyncio.Future()
+
+        bridge = Bridge(['unused'])
+        bridge.process = StubProcess()
+        bridge.connected = True
+        async def crashing_reader():
+            raise OSError('reader exploded')
+        bridge.reader = asyncio.create_task(crashing_reader())
+        await asyncio.wait_for(bridge.close('teardown must survive'), 3)
+        self.assertTrue(bridge.reader.done())
+        self.assertFalse(bridge.connected)
+        state = bridge.snapshot()
+        self.assertTrue(state.stale)
+        self.assertFalse(state.transport_connected)
+        self.assertEqual(state.reason, 'teardown must survive')
+
     async def test_cancellation_closes_helper_and_preserves_stale_snapshot(self):
         helpers = {
             'close': FAKE,

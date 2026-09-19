@@ -9,6 +9,42 @@ from test_server import FAKE, PARAM_FAKE
 
 
 class FeedbackRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_overlapping_snapshot_begin_is_an_observable_protocol_error(self):
+        bridge = Bridge(['unused'])
+        def emit(kind, *fields):
+            bridge.accept(dict(kind=kind, fields=list(map(str, fields))))
+        bridge.accept(dict(kind='transport', connected=True, route=[
+            ['destination', 'Input', 101, 201, 301, 'driver'],
+            ['source', 'Output', 102, 202, 301, 'driver']]))
+        emit('hello', 'MainStage', 2, 'fake-session', 'selection,patch_list,raw_midi_cc')
+        emit('snapshot_begin', 'fake-session', 1, '')
+        emit('selection', 1, 0, 1, 'Fake concert', 'Set', 'In flight')
+        with self.assertRaisesRegex(ValueError, 'overlapping snapshot'):
+            emit('snapshot_begin', 'fake-session', 1, '')
+        bridge.responses['live'] = asyncio.get_running_loop().create_future()
+        with self.assertRaisesRegex(ValueError, 'overlapping snapshot'):
+            emit('snapshot_begin', 'fake-session', 2, 'live')
+        bridge.responses.pop('live')
+        # The rejected begins must not discard the snapshot that was already in flight.
+        emit('item', 1, 0, 1, 'In flight')
+        emit('snapshot_end', 'fake-session', 1, '', 1)
+        self.assertEqual(bridge.snapshot().selection.patch, 'In flight')
+        self.assertFalse(bridge.snapshot().stale)
+        # Preserved behavior: a delayed tagged reply over no transaction is consumed,
+        # and an unsolicited begin over an ignored transaction still starts a fresh snapshot.
+        done = asyncio.get_running_loop().create_future()
+        done.set_result({})
+        bridge.responses['done'] = done
+        emit('snapshot_begin', 'fake-session', 9, 'done')
+        self.assertTrue(bridge.transaction.get('ignored'))
+        emit('snapshot_end', 'fake-session', 9, 'done', 0)
+        self.assertIsNone(bridge.transaction)
+        emit('snapshot_begin', 'fake-session', 2, '')
+        emit('selection', 2, 0, 2, 'Fake concert', 'Set', 'Fresh')
+        emit('snapshot_end', 'fake-session', 2, '', 0)
+        self.assertEqual(bridge.snapshot().selection.patch, 'Fresh')
+        self.assertFalse(bridge.snapshot().stale)
+
     async def test_goodbye_reinitialize_keeps_complete_snapshot_and_rejects_held_context(self):
         fake = FAKE.replace('revision, program = 1, 0', 'revision, program, refreshes = 1, 0, 0')
         fake = fake.replace("    if c['command']=='refresh':",
