@@ -15,6 +15,9 @@ import unicodedata
 PROFILE_ROOT = Path.home() / "Music/Audio Music Apps/MIDI Device Profiles"
 STATE = Path.home() / "Library/Application Support/MainStage MCP/installation.json"
 DRIVER = "com.apple.AppleMIDIIACDriver"
+SYSTEM_PROFILE_ROOTS = (Path("/Library/Audio/MIDI Device Profiles"), Path("/Library/Application Support/Logic/MIDI Device Profiles"))
+# Object handles can change between processes; persistent MIDI IDs cannot.
+ENDPOINT_KEYS = ("direction", "name", "unique_id", "entity_unique_id", "device_unique_id", "device_name", "manufacturer", "model", "driver_owner")
 
 
 def safe_path(value):
@@ -65,9 +68,7 @@ def endpoints(bridge):
 
 
 def identity(rows):
-    # Object handles can change between processes; persistent MIDI IDs cannot.
-    keys = ("direction", "name", "unique_id", "entity_unique_id", "device_unique_id", "device_name", "manufacturer", "model", "driver_owner")
-    return sorted([{key: row.get(key) for key in keys} for row in rows], key=lambda row: json.dumps(row, sort_keys=True))
+    return sorted([{key: row.get(key) for key in ENDPOINT_KEYS} for row in rows], key=lambda row: json.dumps(row, sort_keys=True))
 
 
 def select_device(rows, input_name, output_name):
@@ -123,14 +124,26 @@ def read_manifest(state, root):
     state, root = safe_path(state), safe_path(root)
     if not state.exists():
         return None
-    value = json.loads(state.read_text())
-    if value.get("version") != 1 or value.get("profile_root") != str(root):
+    try:
+        value = json.loads(state.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Corrupt installation manifest {state.name} ({error}); remove {state.name} and the profile it describes, then reinstall") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"Corrupt installation manifest {state.name}; remove {state.name} and the profile it describes, then reinstall")
+    for field in ("profile_root", "file", "input", "output"):
+        if not isinstance(value.get(field), str) or not value[field].strip():
+            raise ValueError(f"Installation manifest field {field!r} must be a nonempty string")
+    if type(value.get("version")) is not int:
+        raise ValueError("Installation manifest field 'version' must be an integer")
+    if not isinstance(value.get("endpoints"), list) or any(not isinstance(row, dict) or not set(ENDPOINT_KEYS) <= row.keys() for row in value["endpoints"]):
+        raise ValueError("Installation manifest field 'endpoints' must be a list of endpoint objects with keys " + ", ".join(ENDPOINT_KEYS))
+    if not isinstance(value.get("sha256"), str) or not re.fullmatch("[0-9a-f]{64}", value["sha256"]):
+        raise ValueError("Installation manifest field 'sha256' must be 64 lowercase hex characters")
+    if value["version"] != 1 or value["profile_root"] != str(root):
         raise ValueError("Installation manifest version/root mismatch")
     target = safe_path(value["file"])
     if target.parent.parent.parent != root or target.name != "config.lua" or not target.parent.name.endswith(".device"):
         raise ValueError("Manifest points outside its owned profile")
-    if not isinstance(value.get("sha256"), str) or len(value["sha256"]) != 64:
-        raise ValueError("Invalid manifest checksum")
     return value
 
 
@@ -142,6 +155,7 @@ def locked(state):
     # Keep one inode so contenders cannot lock different files across an unlink/reopen race.
     fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
+        os.fchmod(fd, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
@@ -154,26 +168,30 @@ def locked(state):
 def conflicts(root, manufacturer, model, owned=None, device_names=()):
     found = []
     candidates = {canonical(name) for name in (model, *device_names)}
-    roots = {safe_path(root), Path("/Library/Audio/MIDI Device Profiles"), Path("/Library/Application Support/Logic/MIDI Device Profiles")}
-    for base in roots:
+    for foreign, base in ((False, safe_path(root)), *((True, path) for path in SYSTEM_PROFILE_ROOTS)):
         if not base.exists():
             continue
         for maker in base.iterdir():
             if canonical(maker.name) != canonical(manufacturer):
                 continue
-            safe_path(maker)
-            if not maker.is_dir():
-                found.append(str(maker))
-                continue
-            for directory in maker.iterdir():
-                name = normalized_component(directory.name)
-                if not name.casefold().endswith(".device") or canonical(name[:-7]) not in candidates:
+            try:
+                safe_path(maker)
+                if not maker.is_dir():
+                    found.append(str(maker))
                     continue
-                safe_path(directory)
-                if owned is None or directory != owned.parent or not directory.is_dir():
-                    found.append(str(directory))
-                    continue
-                found.extend(str(path) for path in directory.rglob("*") if path != owned)
+                for directory in maker.iterdir():
+                    name = normalized_component(directory.name)
+                    if not name.casefold().endswith(".device") or canonical(name[:-7]) not in candidates:
+                        continue
+                    safe_path(directory)
+                    if owned is None or directory != owned.parent or not directory.is_dir():
+                        found.append(str(directory))
+                        continue
+                    found.extend(str(path) for path in directory.rglob("*") if path != owned)
+            except ValueError:
+                # A symlinked system root is foreign territory we cannot inspect; skip it instead of aborting.
+                if not foreign:
+                    raise
     return sorted(found)
 
 
@@ -190,7 +208,16 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
                     or old.get("experimental_mapped_parameter", False) != experimental_mapped_parameter):
             raise ValueError("Existing installation has different configuration; uninstall it first")
         device_names = {row["device_name"] for row in before if row.get("name") in (input_name, output_name)}
-        conflicting = conflicts(root, manufacturer, model, target if old else None, device_names)
+        orphan = False
+        if old is None:
+            template = template or files("mainstage_mcp").joinpath("profile.lua")
+            data = render(template, input_name, output_name, manufacturer, model,
+                          experimental_actions, experimental_mapped_parameter)
+            # A crash between publishing config.lua and the manifest leaves our own bytes behind; adopt them.
+            orphan = target.is_file() and target.read_bytes() == data
+            if target.exists() and not orphan:
+                raise ValueError("Conflicting profile file: " + str(target))
+        conflicting = conflicts(root, manufacturer, model, target if (old or orphan) else None, device_names)
         if conflicting:
             raise ValueError("Conflicting profile files: " + ", ".join(conflicting))
         if old:
@@ -201,9 +228,6 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
             return {"installed": True, "changed": False, "file": str(target),
                     "experimental_actions": experimental_actions,
                     "experimental_mapped_parameter": experimental_mapped_parameter}
-        template = template or files("mainstage_mcp").joinpath("profile.lua")
-        data = render(template, input_name, output_name, manufacturer, model,
-                      experimental_actions, experimental_mapped_parameter)
         manifest = {"version": 1, "profile_root": str(root), "file": str(target), "sha256": digest(data), "input": input_name, "output": output_name,
                     "experimental_actions": experimental_actions,
                     "experimental_mapped_parameter": experimental_mapped_parameter,
@@ -212,8 +236,9 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
         state_created = False
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            write_exclusive(target, data)
-            created = True
+            if not orphan:
+                write_exclusive(target, data)
+                created = True
             if identity(endpoints(bridge)) != identity(before):
                 raise ValueError("MIDI identities changed during installation; profile rolled back")
             write_exclusive(state, (json.dumps(manifest, indent=2) + "\n").encode())
@@ -227,6 +252,10 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
                     target.parent.rmdir()
                 except OSError:
                     pass
+            try:
+                target.parent.parent.rmdir()
+            except OSError:
+                pass
             raise
         return {"installed": True, "changed": True, "file": str(target),
                 "experimental_actions": experimental_actions,
