@@ -20,6 +20,7 @@ from mainstage_mcp import __version__
 MidiByte = Annotated[StrictInt, Field(ge=0, le=127)]
 Channel = Annotated[StrictInt, Field(ge=1, le=16)]
 Revision = Annotated[StrictInt, Field(ge=0)]
+Session = Annotated[str, Field(min_length=1)]
 MAX_LINE = 512 * 1024  # JSON escaping can expand a 64 KiB SysEx frame.
 MAX_SNAPSHOT = 4 * 1024 * 1024
 BASE_CAPABILITIES = {'selection', 'patch_list', 'raw_midi_cc'}
@@ -267,6 +268,8 @@ class Bridge:
                 # Consume delayed tagged replies without changing current state or freshness.
                 self.transaction = dict(ignored=True)
                 return
+            if self.transaction and not self.transaction.get('ignored'):
+                raise ValueError('overlapping snapshot')
             self.invalidate('snapshot incomplete')
             if fields[0] != self.session or not self.profile_seen:
                 raise ValueError('snapshot session mismatch')
@@ -304,10 +307,12 @@ class Bridge:
                     return
                 if (fields[:3] != [tx['session'], str(tx['revision']), tx['request']] or
                         number(fields[3], 0, 4096) != len(tx['items']) or tx['selection'] is None):
+                    self.transaction = None  # A rejected end marker terminates the cycle.
                     raise ValueError('snapshot end mismatch')
                 if (self.complete and self.complete['session'] == tx['session'] and
                         self.complete['revision'] == tx['revision'] and
                         any(self.complete[k] != tx[k] for k in ('selection', 'items'))):
+                    self.transaction = None
                     raise ValueError('snapshot content changed without revision')
                 self.complete = {k: tx[k] for k in ('session', 'client_session', 'revision', 'items', 'selection')}
                 self.complete['observed_at'] = time.time()
@@ -376,10 +381,10 @@ class Bridge:
                     return self.snapshot()
         except (TimeoutError, OSError, ValueError) as error:
             if acquired:
-                self.invalidate('refresh failed or timed out')
+                self.invalidate(str(error) or 'refresh failed or timed out')
             raise ToolError(str(error) or 'Profile refresh timed out') from error
 
-    async def mutate(self, command: str, expected_session: str, expected_revision: int, **values) -> dict:
+    async def mutate(self, command: str, expected_session: Session, expected_revision: int, **values) -> dict:
         acquired = False
         sent = False
         attempted = False
@@ -495,7 +500,9 @@ class Bridge:
             raise
         except (TimeoutError, OSError, ValueError) as error:
             if acquired:
-                self.invalidate(str(error) or 'command timed out')
+                self.invalidate(str(error) or
+                                ('Action press may have triggered; release not confirmed'
+                                 if is_action and confirmed else 'command timed out'))
             if is_action and attempted:
                 return dict(action=action, experimental=action != 'metronome', sent=False,
                             observed=False, may_have_triggered=True, messages_confirmed=confirmed,
@@ -540,21 +547,23 @@ class Bridge:
     async def close(self, reason='bridge stopped'):
         if self.process is None:
             return
-        if self.process.returncode is None:
-            with suppress(ProcessLookupError):
-                self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), 1)
-            except TimeoutError:
+        try:
+            if self.process.returncode is None:
                 with suppress(ProcessLookupError):
-                    self.process.kill()
-                await asyncio.wait_for(self.process.wait(), 1)
-        if self.reader:
-            self.reader.cancel()
-            with suppress(asyncio.CancelledError):
-                await self.reader
-        self.connected = False
-        self.invalidate(reason)
+                    self.process.terminate()
+                try:
+                    await asyncio.wait_for(self.process.wait(), 1)
+                except TimeoutError:
+                    with suppress(ProcessLookupError):
+                        self.process.kill()
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(self.process.wait(), 1)
+            if self.reader:
+                self.reader.cancel()
+                await asyncio.gather(self.reader, return_exceptions=True)
+        finally:
+            self.connected = False
+            self.invalidate(reason)
 
 
 def create_server(bridge: Bridge) -> MCPServer:
@@ -589,13 +598,13 @@ def create_server(bridge: Bridge) -> MCPServer:
         return await bridge.reconnect()
 
     @server.tool()
-    async def mainstage_select_program(program: MidiByte, expected_session: str, expected_revision: Revision, channel: Channel = 1) -> dict:
+    async def mainstage_select_program(program: MidiByte, expected_session: Session, expected_revision: Revision, channel: Channel = 1) -> dict:
         """Select the assigned MIDI program (0–127), not a list index. Require last-read session/revision; report MIDI sent separately from observed selection."""
         return await bridge.mutate('pc', expected_session, expected_revision, program=program, channel=channel)
 
     @server.tool()
     async def mainstage_select_bank_program(bank_msb: MidiByte, bank_lsb: MidiByte, program: MidiByte,
-                                            expected_session: str, expected_revision: Revision,
+                                            expected_session: Session, expected_revision: Revision,
                                             channel: Channel = 1) -> dict:
         """Send Bank Select MSB, LSB, then Program Change once. MainStage assignments determine the result; bank state cannot be observed."""
         return await bridge.mutate('bank_pc', expected_session, expected_revision,
@@ -603,22 +612,22 @@ def create_server(bridge: Bridge) -> MCPServer:
                                    program=program, channel=channel)
 
     @server.tool()
-    async def mainstage_send_cc(control: MidiByte, value: MidiByte, expected_session: str, expected_revision: Revision, channel: Channel = 1) -> dict:
+    async def mainstage_send_cc(control: MidiByte, value: MidiByte, expected_session: Session, expected_revision: Revision, channel: Channel = 1) -> dict:
         """Advanced raw MIDI CC. Mapping determines effect; no action completion or parameter feedback is available. Requires last-read session/revision."""
         return await bridge.mutate('cc', expected_session, expected_revision, control=control, value=value, channel=channel)
 
     @server.tool()
-    async def mainstage_toggle_metronome(expected_session: str, expected_revision: Revision) -> dict:
+    async def mainstage_toggle_metronome(expected_session: Session, expected_revision: Revision) -> dict:
         """Toggle metronome using a profile-advertised binding. Sends one press/release; no metronome on/off state or action completion feedback exists. Never automatically retry."""
         return await bridge.mutate('toggle_metronome', expected_session, expected_revision)
 
     @server.tool()
-    async def mainstage_trigger_action(action: ActionName, expected_session: str, expected_revision: Revision) -> dict:
+    async def mainstage_trigger_action(action: ActionName, expected_session: Session, expected_revision: Revision) -> dict:
         """Trigger one profile-advertised named action. Non-metronome names are experimental. Sends one press/release and reports MIDI transport only; no action result or state is observed. Never automatically retry."""
         return await bridge.mutate('action', expected_session, expected_revision, action=action)
 
     @server.tool()
-    async def mainstage_set_mapped_parameter_1(value: MidiByte, expected_session: str, expected_revision: Revision) -> dict:
+    async def mainstage_set_mapped_parameter_1(value: MidiByte, expected_session: Session, expected_revision: Revision) -> dict:
         """Experimental opt-in CC90 slot. Observe only a newer matching screen-control callback; never claim plug-in enumeration or effect."""
         return await bridge.mutate('set_mapped_parameter_1', expected_session, expected_revision, value=value)
 
@@ -634,6 +643,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not 0 < args.timeout <= 30:
         parser.error('--timeout must be in (0, 30]')
+    for flag, name in (('--input', args.input), ('--output', args.output)):
+        if not name.strip() or '\x00' in name or '\n' in name:
+            parser.error(f'{flag} must be a nonempty endpoint name without NUL or newline')
     command = [args.bridge, '--iac-input', args.input, '--iac-output', args.output]
     create_server(Bridge(command, args.timeout)).run(transport='stdio')
 

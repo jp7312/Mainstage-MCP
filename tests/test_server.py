@@ -1,15 +1,18 @@
 """Offline regressions: simulated native bridge, real official SDK client. No MainStage."""
 import asyncio
+import io
 import json
 import os
+from contextlib import redirect_stderr
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from mcp.client import Client
 from mcp.client.stdio import StdioServerParameters
-from mainstage_mcp.server import Bridge, create_server
+from mainstage_mcp.server import Bridge, create_server, main
 from mcp.server.mcpserver.exceptions import ToolError
 
 FAKE = r'''
@@ -217,7 +220,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         try:
             s=await b.refresh()
             t=asyncio.create_task(b.mutate('pc',s.session,s.revision,program=5,channel=1))
-            while b.counter < 3: await asyncio.sleep(.001)
+            async with asyncio.timeout(2):
+                while b.counter < 3: await asyncio.sleep(.001)
             await asyncio.sleep(.02)
             t.cancel()
             with self.assertRaises(asyncio.CancelledError): await t
@@ -429,6 +433,23 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(result['messages_confirmed'],2 if case == 'full' else 1)
                         if case == 'partial': self.assertTrue(result['may_have_triggered'])
 
+    async def test_action_timeout_after_confirmed_press_reports_precise_reason(self):
+        fake = FAKE.replace('selection,patch_list,raw_midi_cc',
+                            'selection,patch_list,raw_midi_cc,metronome_toggle')
+        fake = fake.replace("    print(json.dumps(dict(kind='command_result'",
+                            "    if c['command']=='cc' and c['value']==0:\n        import time; time.sleep(30)\n    print(json.dumps(dict(kind='command_result'")
+        b = Bridge([sys.executable,'-u','-c',fake],.2)
+        await b.start()
+        try:
+            state = await b.refresh()
+            result = await b.mutate('toggle_metronome', state.session, state.revision)
+            self.assertTrue(result['may_have_triggered'])
+            self.assertFalse(result['sent'])
+            self.assertEqual(result['messages_confirmed'], 1)
+            self.assertTrue(b.snapshot().stale)
+            self.assertEqual(b.snapshot().reason, 'Action press may have triggered; release not confirmed')
+        finally: await b.close()
+
     async def test_bank_program_is_serialized_strict_and_truthful(self):
         with tempfile.TemporaryDirectory() as directory:
             for partial in (False, True):
@@ -467,6 +488,37 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(result['program_observed']); self.assertFalse(result['bank_observed'])
                         self.assertEqual(result['messages_attempted'], 3)
                         self.assertEqual(result['messages_confirmed'], 3)
+
+    async def test_empty_expected_session_is_rejected_at_schema_level(self):
+        b = Bridge([sys.executable, '-u', '-c', FAKE], .5)
+        async with Client(create_server(b)) as client:
+            state = value(await client.call_tool('mainstage_refresh'))
+            args = dict(expected_session='', expected_revision=state['revision'])
+            for tool, extra in (('mainstage_select_program', dict(program=0)),
+                                ('mainstage_select_bank_program', dict(bank_msb=0, bank_lsb=0, program=0)),
+                                ('mainstage_send_cc', dict(control=7, value=10)),
+                                ('mainstage_toggle_metronome', {}),
+                                ('mainstage_trigger_action', dict(action='metronome')),
+                                ('mainstage_set_mapped_parameter_1', dict(value=0))):
+                rejected = await client.call_tool(tool, dict(args, **extra))
+                self.assertTrue(rejected.is_error, tool)
+            self.assertEqual(b.counter, 1, 'Schema-invalid session strings never reach the native bridge')
+
+    def test_main_rejects_blank_or_unsafe_endpoint_names(self):
+        for argv in (['--bridge', 'helper', '--input', ''],
+                     ['--bridge', 'helper', '--input', '   '],
+                     ['--bridge', 'helper', '--input', 'In\nPut'],
+                     ['--bridge', 'helper', '--input', 'In\x00Put'],
+                     ['--bridge', 'helper', '--output', ''],
+                     ['--bridge', 'helper', '--output', '\t'],
+                     ['--bridge', 'helper', '--output', 'Out\x00Put'],
+                     ['--bridge', 'helper', '--input', 'ok', '--output', '']):
+            with redirect_stderr(io.StringIO()):
+                with patch('mainstage_mcp.server.create_server',
+                           side_effect=AssertionError('endpoint validation must run first')):
+                    with self.assertRaises(SystemExit) as exited:
+                        main(argv)
+            self.assertEqual(exited.exception.code, 2)
 
     async def test_real_stdio_sdk(self):
         with tempfile.TemporaryDirectory() as directory:
