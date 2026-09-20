@@ -5,7 +5,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 
-from mainstage_mcp.concert_inspector import ConcertFormatError, inspect_concert, main
+from mainstage_mcp.concert_inspector import MAX_PLIST_BYTES, ConcertFormatError, inspect_concert, main
 
 
 def write(path: Path, value: dict) -> None:
@@ -107,6 +107,82 @@ class ConcertInspectorTests(unittest.TestCase):
             })
             with self.assertRaisesRegex(ConcertFormatError, "unsafe node filename"):
                 inspect_concert(root)
+
+    def test_resource_limits_and_missing_pieces_are_clean_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Handcrafted.concert"
+            write(root / "data.plist", {"Version": 57057, "padding": "x" * (MAX_PLIST_BYTES + 8)})
+            with self.assertRaisesRegex(ConcertFormatError, "plist exceeds"):
+                inspect_concert(root)
+
+            write(root / "data.plist", {"Version": 57057})
+            outside = Path(temporary) / "outside.plist"
+            outside.write_bytes(b"synthetic")
+            (root / "data.plist").unlink()
+            (root / "data.plist").symlink_to(outside)
+            with self.assertRaisesRegex(ConcertFormatError, "missing or unsafe plist: data.plist"):
+                inspect_concert(root)
+
+            (root / "data.plist").unlink()
+            with self.assertRaisesRegex(ConcertFormatError, "missing or unsafe plist: data.plist"):
+                inspect_concert(root)
+            with self.assertRaisesRegex(ConcertFormatError, "expected a non-symlink .concert directory"):
+                inspect_concert(Path(temporary) / "Absent.concert")
+
+            (root / "data.plist").write_bytes(plistlib.dumps(["not", "a", "dict"], fmt=plistlib.FMT_BINARY))
+            with self.assertRaisesRegex(ConcertFormatError, "plist root must be a dictionary: data.plist"):
+                inspect_concert(root)
+
+    def test_rejects_nul_bytes_in_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Handcrafted.concert"
+            write(root / "data.plist", {"Version": 57057})
+            write(root / "Concert.patch/data.plist", {
+                "VersionPatches": 40014, "channels": [], "nodes": ["A\x00b.patch"],
+                "patch": {"engineNode": engine("Fixture")},
+            })
+            with self.assertRaisesRegex(ConcertFormatError, "node filename contains NUL"):
+                inspect_concert(root)
+
+            write(root / "Concert.patch/data.plist", {
+                "VersionPatches": 40014,
+                "channels": [{
+                    "Channel_name": "Keys", "UUID": "synthetic-channel-1", "Channel_instID": 7,
+                    "Channel_inputIsBus": False, "Channel_inputIndex_1": -1,
+                    "Channel_outputIsBus": False, "Channel_outputIndex": 0,
+                    "Channel_isMuted": False, "Channel_isSolo": False,
+                    "Filename": "Keys\x00.cst",
+                }],
+                "patch": {"engineNode": engine("Fixture")},
+            })
+            with self.assertRaisesRegex(ConcertFormatError, "channel setting filename contains NUL"):
+                inspect_concert(root)
+
+            write(root / "Concert.patch/data.plist", {
+                "VersionPatches": 40014, "channels": [],
+                "patch": {"engineNode": engine("A\x00b")},
+            })
+            with self.assertRaisesRegex(ConcertFormatError, "node name contains NUL"):
+                inspect_concert(root)
+
+            stdout, stderr = StringIO(), StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as exit_error:
+                    main([str(root)])
+            self.assertEqual(exit_error.exception.code, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("concert-inspector: node name contains NUL", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_accepts_uppercase_concert_suffix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "DEMO.CONCERT"
+            write(root / "data.plist", {"Version": 57057})
+            write(root / "Concert.patch/data.plist", {
+                "VersionPatches": 40014, "channels": [],
+                "patch": {"engineNode": engine("Fixture")},
+            })
+            self.assertEqual(inspect_concert(root)["concert"]["name"], "Fixture")
 
 
 if __name__ == "__main__":
