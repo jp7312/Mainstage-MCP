@@ -43,7 +43,7 @@ make test
 make loopback
 ```
 
-Follow [setup and removal](docs/SETUP.md) before starting the server. Installation requires two manually prepared, dedicated IAC buses. The installer never creates buses or edits MIDI setup. IAC profile matching applies to the shared parent device; adding/removing buses can change existing MIDI endpoint IDs and affect other assignments.
+Follow [setup and removal](docs/SETUP.md) before starting the server. Installing the Python package provides only the Python layer; the native Swift bridge is not installed by pip and must be built from a source checkout with `make build`. Installation requires two manually prepared, dedicated IAC buses. The installer never creates buses or edits MIDI setup. IAC profile matching applies to the shared parent device; adding/removing buses can change existing MIDI endpoint IDs and affect other assignments.
 
 ```sh
 .venv/bin/mainstage-mcp serve --bridge "$PWD/build/bridge" \

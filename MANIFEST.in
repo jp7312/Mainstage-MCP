@@ -2,3 +2,4 @@ include Makefile CONTRACT.md
 include native/bridge.swift
 recursive-include docs *.md
 recursive-include tests *.py *.lua
+global-exclude __pycache__ *.pyc .DS_Store
