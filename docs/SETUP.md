@@ -36,6 +36,8 @@ From the repository root:
 
 Installation discovers the localized IAC manufacturer/model and writes one `config.lua` beneath `~/Music/Audio Music Apps/MIDI Device Profiles`. It records ownership, a checksum, and endpoint identities in `~/Library/Application Support/MainStage MCP/installation.json`. Repeating installation with unchanged configuration is a no-op. Conflicting profiles, changed owned files, or changed MIDI identities are errors, not permission to overwrite them.
 
+Install and uninstall share a persistent empty `installation.json.lock` file. Lock ownership is released when its process exits; file existence does not mean an operation is running. Do not delete it; keeping one inode avoids unlink/reopen races.
+
 For a disposable live action experiment only, add `--experimental-actions` to the install command. This additionally reserves channel-16 CC85–87 and advertises panic, master mute and play/stop. The group remains disabled by default: master mute and play/stop have narrow binding-level evidence, while panic remains unverified. Navigation actions are not exposed after live no-op results. Switching modes requires uninstalling the owned profile first; the installer refuses to rewrite it in place.
 
 `doctor` performs read-only static checks. Its `runtime_handshake_tested: false` explicitly means it has not established a live MainStage connection. Diagnostics may include local paths/device metadata; review them before sharing.
@@ -82,7 +84,7 @@ Program Change uses the MIDI program assigned in your concert, not the position 
 
 ## Inspect one concert offline
 
-`mainstage-mcp inspect-concert PATH` is an experimental, read-only CLI for the exact observed MainStage 4.3.1 (5233) plist versions `Version=57057` and `VersionPatches=40014`. It reports bounded hierarchy, routes and assignment metadata while treating channel-setting and plug-in state as opaque. It rejects other versions and is not exposed through MCP.
+`mainstage-mcp inspect-concert PATH` is an experimental, read-only CLI for the exact observed MainStage 4.3.1 (5233) plist versions `Version=57057` and `VersionPatches=40014`. It reports bounded hierarchy, routes and assignment metadata while treating channel-setting and plug-in state as opaque. It rejects other versions and malformed XML plists as concert-format errors; CLI rejection exits 2 without a traceback. It is not exposed through MCP.
 
 ## Upgrade
 

@@ -1,6 +1,7 @@
 """Installer checks use isolated directories and fake read-only bridge output."""
 import copy
 import json
+import multiprocessing
 from pathlib import Path
 import shutil
 import tempfile
@@ -8,6 +9,17 @@ import unittest
 from unittest.mock import patch
 
 from mainstage_mcp import installation as setup
+
+
+def hold_lock(state, connection):
+    try:
+        with setup.locked(Path(state)):
+            connection.send(None)
+            connection.recv()
+    except BaseException as error:
+        connection.send(repr(error))
+    finally:
+        connection.close()
 
 
 def rows():
@@ -192,6 +204,48 @@ class InstallationTests(unittest.TestCase):
         self.template.write_text(self.template.read_text().replace("__MS_EXPERIMENTAL_PARAMETER__", "false"))
         with self.assertRaisesRegex(ValueError, "missing __MS_EXPERIMENTAL_PARAMETER__"):
             setup.render(self.template, "in", "out", "maker", "model")
+
+    def test_lock_survives_process_death_without_staying_owned(self):
+        lock = Path(str(self.state) + ".lock")
+        lock.parent.mkdir(parents=True)
+        lock.touch(mode=0o600)
+        inode = lock.stat().st_ino
+        with setup.locked(self.state):
+            self.assertEqual(lock.stat().st_ino, inode)
+
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe()
+        holder = context.Process(target=hold_lock, args=(self.state, child))
+        try:
+            holder.start()
+            child.close()
+            self.assertTrue(parent.poll(5), "lock holder did not start")
+            self.assertIsNone(parent.recv())
+            with self.assertRaisesRegex(OSError, "already running"):
+                with setup.locked(self.state):
+                    self.fail("acquired a lock owned by another process")
+            self.assertEqual(lock.stat().st_ino, inode)
+            holder.terminate()
+            holder.join(5)
+            self.assertFalse(holder.is_alive(), "lock holder did not terminate")
+            with setup.locked(self.state):
+                self.assertEqual(lock.stat().st_ino, inode)
+            self.assertTrue(lock.exists())
+            self.assertEqual(lock.stat().st_ino, inode)
+        finally:
+            if holder.is_alive():
+                holder.kill()
+                holder.join(5)
+            parent.close()
+            child.close()
+
+    def test_lock_symlink_is_rejected(self):
+        lock = Path(str(self.state) + ".lock")
+        lock.parent.mkdir(parents=True)
+        lock.symlink_to(self.base / "elsewhere")
+        with self.assertRaisesRegex(ValueError, "symbolic link"):
+            with setup.locked(self.state):
+                pass
 
 
 if __name__ == "__main__":

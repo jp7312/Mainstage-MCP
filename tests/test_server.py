@@ -126,6 +126,32 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         finally: await b.close()
         self.assertFalse(b.snapshot().bridge_running)
 
+    async def test_mutation_lock_timeout_preserves_active_snapshot(self):
+        b = Bridge(['unused'], .01)
+        transaction = {'request': 'active'}
+        b.transaction = transaction
+        b.stale, b.reason = True, 'snapshot incomplete'
+        b.responsive_clock, b.responsive_at = 123.0, 456.0
+        freshness = (b.stale, b.reason, b.responsive_clock, b.responsive_at)
+        sends = 0
+
+        async def send(*args, **values):
+            nonlocal sends
+            sends += 1
+
+        b.send = send
+        await b.lock.acquire()
+        try:
+            with self.assertRaises(ToolError) as timed_out:
+                await asyncio.wait_for(
+                    b.mutate('cc', 'session', 1, control=7, value=10, channel=1), .2)
+        finally:
+            b.lock.release()
+        self.assertEqual(str(timed_out.exception), 'No MIDI mutation sent: timeout')
+        self.assertEqual(sends, 0)
+        self.assertIs(b.transaction, transaction)
+        self.assertEqual((b.stale, b.reason, b.responsive_clock, b.responsive_at), freshness)
+
     async def test_explicit_reconnect_after_helper_crash_invalidates_held_context(self):
         b = Bridge([sys.executable,'-u','-c',FAKE], .5)
         await b.start()

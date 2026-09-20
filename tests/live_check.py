@@ -1,4 +1,4 @@
-"""Opt-in MainStage check. Reads only unless --program is explicitly supplied."""
+"""MainStage check. Reads by default; --reconnect restarts the helper, --program changes patches."""
 import argparse
 import asyncio
 import json
@@ -33,6 +33,18 @@ async def check(args):
         if state['selection']['concert'] != args.concert:
             raise RuntimeError('Concert name differs; no mutation sent')
         print(json.dumps(dict(protocol=client.protocol_version, state=state), ensure_ascii=False))
+        if args.reconnect:
+            previous_session = state['session']
+            if not previous_session:
+                raise RuntimeError('Initial session is empty; no reconnect sent')
+            state = result_value(await client.call_tool('mainstage_reconnect'))
+            if state['stale'] or not state['host_responsive']:
+                raise RuntimeError('Reconnect did not produce fresh responsive state')
+            if state['selection']['concert'] != args.concert:
+                raise RuntimeError('Concert context changed after reconnect; no mutation sent')
+            if not state['session'] or state['session'] == previous_session:
+                raise RuntimeError('Reconnect did not produce a new nonempty session')
+            print(json.dumps(dict(reconnected=True, state=state), ensure_ascii=False))
         for program in args.program:
             # Names are a test guard, not a durable concert identity or transaction.
             state = result_value(await client.call_tool('mainstage_refresh'))
@@ -51,6 +63,8 @@ def main():
     parser.add_argument('--concert', required=True, help='Exact disposable concert name')
     parser.add_argument('--input', default='MS Bridge Input')
     parser.add_argument('--output', default='MS Bridge Output')
+    parser.add_argument('--reconnect', action='store_true',
+                        help='Explicitly restart the owned helper once and verify a fresh same-concert session')
     parser.add_argument('--program', type=program_number, action='append', default=[],
                         help='Explicitly allow this program change; repeat for a sequence')
     asyncio.run(check(parser.parse_args()))

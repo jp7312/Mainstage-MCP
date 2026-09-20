@@ -260,6 +260,11 @@ class Bridge:
             value['observedAt'] = time.time()
             self.parameter = value
         elif kind == 'snapshot_begin':
+            future = self.responses.get(fields[2])
+            if fields[2] and (future is None or future.done()):
+                # Consume delayed tagged replies without changing current state or freshness.
+                self.transaction = dict(ignored=True)
+                return
             self.invalidate('snapshot incomplete')
             if fields[0] != self.session or not self.profile_seen:
                 raise ValueError('snapshot session mismatch')
@@ -272,6 +277,10 @@ class Bridge:
             tx = self.transaction
             if tx is None:
                 raise ValueError('feedback outside snapshot')
+            if tx.get('ignored'):
+                if kind == 'snapshot_end':
+                    self.transaction = None
+                return
             tx['size'] += sum(len(f.encode('utf-8')) for f in fields)
             if tx['size'] > MAX_SNAPSHOT:
                 raise ValueError('snapshot too large')
@@ -287,6 +296,10 @@ class Bridge:
                 tx['items'].append(dict(isPatch=fields[0] == '1',
                     setIndex=number(fields[1], -1, 2**31-1), patchIndex=number(fields[2], -1, 2**31-1), label=fields[3]))
             else:
+                future = self.responses.get(tx['request'])
+                if tx['request'] and (future is None or future.done()):
+                    self.transaction = None
+                    return
                 if (fields[:3] != [tx['session'], str(tx['revision']), tx['request']] or
                         number(fields[3], 0, 4096) != len(tx['items']) or tx['selection'] is None):
                     raise ValueError('snapshot end mismatch')
@@ -298,9 +311,8 @@ class Bridge:
                 self.complete['observed_at'] = time.time()
                 self.transaction = None
                 self.stale, self.reason = False, None
-                future = self.responses.get(tx['request'])
+                self.responsive_clock, self.responsive_at = time.monotonic(), time.time()
                 if future and not future.done():
-                    self.responsive_clock, self.responsive_at = time.monotonic(), time.time()
                     future.set_result(copy.deepcopy(self.complete))
 
     async def read(self, process):
@@ -326,7 +338,8 @@ class Bridge:
     async def send(self, command: str, **values):
         if not self.ready.is_set():
             await self.ready.wait()
-        if not self.connected or self.process is None or self.process.returncode is not None:
+        if (not self.connected or self.process is None or self.process.returncode is not None
+                or getattr(self.process, 'stdin', None) is None):
             raise ValueError('bridge transport unavailable; restart after fixing endpoints')
         self.counter += 1
         ident = f'{self.request_prefix}_{self.counter}'
@@ -351,17 +364,21 @@ class Bridge:
             self.responses.pop(ident, None)
 
     async def refresh(self) -> State:
+        acquired = False
         try:
             async with asyncio.timeout(self.timeout):
                 async with self.lock:
+                    acquired = True
                     self.invalidate('refresh pending')
                     await self.send('refresh')
                     return self.snapshot()
         except (TimeoutError, OSError, ValueError) as error:
-            self.invalidate('refresh failed or timed out')
+            if acquired:
+                self.invalidate('refresh failed or timed out')
             raise ToolError(str(error) or 'Profile refresh timed out') from error
 
     async def mutate(self, command: str, expected_session: str, expected_revision: int, **values) -> dict:
+        acquired = False
         sent = False
         attempted = False
         confirmed = 0
@@ -373,6 +390,7 @@ class Bridge:
         try:
             async with asyncio.timeout(self.timeout):
                 async with self.lock:
+                    acquired = True
                     await self.send('refresh')
                     current = self.complete
                     if self.snapshot().stale:
@@ -474,7 +492,8 @@ class Bridge:
                                  'MIDI mutation observation cancelled; refresh required'))
             raise
         except (TimeoutError, OSError, ValueError) as error:
-            self.invalidate(str(error) or 'command timed out')
+            if acquired:
+                self.invalidate(str(error) or 'command timed out')
             if is_action and attempted:
                 return dict(action=action, experimental=action != 'metronome', sent=False,
                             observed=False, may_have_triggered=True, messages_confirmed=confirmed,
@@ -494,13 +513,13 @@ class Bridge:
                 return dict(sent=True, observed=False, timed_out=isinstance(error, TimeoutError),
                             error=str(error) or 'feedback timed out', state=self.snapshot().model_dump())
             prefix = "MIDI may have been sent" if attempted else "No MIDI mutation sent"
-            raise ToolError(f'{prefix}: {error or "timeout"}') from error
+            raise ToolError(f'{prefix}: {str(error) or "timeout"}') from error
 
     async def reconnect(self) -> State:
         async with self.lock:
             self.invalidate('explicit reconnect pending')
-            await self.close('explicit reconnect pending')
             try:
+                await self.close('explicit reconnect pending')
                 await self.start()
                 async with asyncio.timeout(self.timeout):
                     await self.ready.wait()
@@ -508,6 +527,9 @@ class Bridge:
                         raise ValueError(self.reason or 'bridge transport unavailable')
                     await self.send('refresh')
                     return self.snapshot()
+            except asyncio.CancelledError:
+                await self.close('explicit reconnect cancelled')
+                raise
             except (TimeoutError, OSError, ValueError) as error:
                 reason = str(error) or 'reconnect timed out'
                 await self.close(reason)
@@ -608,6 +630,8 @@ def main(argv=None):
     parser.add_argument('--input', default='MS Bridge Input')
     parser.add_argument('--output', default='MS Bridge Output')
     args = parser.parse_args(argv)
+    if not 0 < args.timeout <= 30:
+        parser.error('--timeout must be in (0, 30]')
     command = [args.bridge, '--iac-input', args.input, '--iac-output', args.output]
     create_server(Bridge(command, args.timeout)).run(transport='stdio')
 
