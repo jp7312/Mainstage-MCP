@@ -679,8 +679,8 @@ def main(argv=None):
     if not 0 < args.timeout <= 30:
         parser.error('--timeout must be in (0, 30]')
     for flag, name in (('--input', args.input), ('--output', args.output)):
-        if not name.strip() or '\x00' in name or '\n' in name:
-            parser.error(f'{flag} must be a nonempty endpoint name without NUL or newline')
+        if not name.strip() or any(c < ' ' for c in name):
+            parser.error(f'{flag} must be a nonempty endpoint name without control characters')
     command = [args.bridge, '--iac-input', args.input, '--iac-output', args.output]
     create_server(Bridge(command, args.timeout)).run(transport='stdio')
 
