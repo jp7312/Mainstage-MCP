@@ -271,7 +271,13 @@ class Bridge:
                 self.transaction = dict(ignored=True)
                 return
             if self.transaction and not self.transaction.get('ignored'):
-                raise ValueError('overlapping snapshot')
+                # Neither batch may commit: fail their waiters now and consume the rest of this batch.
+                for waiter in (self.responses.get(self.transaction['request']), future):
+                    if waiter and not waiter.done():
+                        waiter.set_result({'error': 'overlapping snapshot'})
+                self.invalidate('overlapping snapshot')
+                self.transaction = dict(ignored=True)
+                return
             self.invalidate('snapshot incomplete')
             if fields[0] != self.session or not self.profile_seen:
                 raise ValueError('snapshot session mismatch')
@@ -545,7 +551,8 @@ class Bridge:
                     await self.send('refresh')
                     return self.snapshot()
             except asyncio.CancelledError:
-                await self.close('explicit reconnect cancelled')
+                with suppress(ToolError):  # A surviving helper stays visible in state.
+                    await self.close('explicit reconnect cancelled')
                 raise
             except (TimeoutError, OSError, ValueError) as error:
                 reason = str(error) or 'reconnect timed out'
@@ -566,12 +573,17 @@ class Bridge:
                         self.process.kill()
                     with suppress(TimeoutError):
                         await asyncio.wait_for(self.process.wait(), 1)
+            survived = self.process.returncode is None
+            if survived:
+                reason = 'bridge helper did not exit after SIGKILL; it may still hold the MIDI endpoints'
             if self.reader:
                 self.reader.cancel()
                 await asyncio.gather(self.reader, return_exceptions=True)
         finally:
             self.connected = False
             self.invalidate(reason)
+        if survived:  # Never report closed, or let reconnect() spawn, while the old helper may hold the endpoints.
+            raise ToolError(reason)
 
 
 def create_server(bridge: Bridge) -> MCPServer:
@@ -667,8 +679,8 @@ def main(argv=None):
     if not 0 < args.timeout <= 30:
         parser.error('--timeout must be in (0, 30]')
     for flag, name in (('--input', args.input), ('--output', args.output)):
-        if not name.strip() or '\x00' in name or '\n' in name:
-            parser.error(f'{flag} must be a nonempty endpoint name without NUL or newline')
+        if not name.strip() or any(c < ' ' for c in name):
+            parser.error(f'{flag} must be a nonempty endpoint name without control characters')
     command = [args.bridge, '--iac-input', args.input, '--iac-output', args.output]
     create_server(Bridge(command, args.timeout)).run(transport='stdio')
 

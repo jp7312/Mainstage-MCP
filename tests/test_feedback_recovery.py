@@ -10,7 +10,7 @@ from mainstage_mcp.server import Bridge
 
 
 class FeedbackRecoveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_overlapping_snapshot_begin_is_an_observable_protocol_error(self):
+    async def test_overlapping_snapshot_begin_commits_neither_batch_and_fails_its_waiters(self):
         bridge = Bridge(['unused'])
         def emit(kind, *fields):
             bridge.accept(dict(kind=kind, fields=list(map(str, fields))))
@@ -18,19 +18,24 @@ class FeedbackRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ['destination', 'Input', 101, 201, 301, 'driver'],
             ['source', 'Output', 102, 202, 301, 'driver']]))
         emit('hello', 'MainStage', 2, 'fake-session', 'selection,patch_list,raw_midi_cc')
-        emit('snapshot_begin', 'fake-session', 1, '')
-        emit('selection', 1, 0, 1, 'Fake concert', 'Set', 'In flight')
-        with self.assertRaisesRegex(ValueError, 'overlapping snapshot'):
-            emit('snapshot_begin', 'fake-session', 1, '')
-        bridge.responses['live'] = asyncio.get_running_loop().create_future()
-        with self.assertRaisesRegex(ValueError, 'overlapping snapshot'):
-            emit('snapshot_begin', 'fake-session', 2, 'live')
-        bridge.responses.pop('live')
-        # The rejected begins must not discard the snapshot that was already in flight.
-        emit('item', 1, 0, 1, 'In flight')
-        emit('snapshot_end', 'fake-session', 1, '', 1)
-        self.assertEqual(bridge.snapshot().selection.patch, 'In flight')
-        self.assertFalse(bridge.snapshot().stale)
+        for in_flight, overlapping in (('', ''), ('', 'live'), ('live', '')):
+            with self.subTest(in_flight=in_flight, overlapping=overlapping):
+                live = bridge.responses['live'] = asyncio.get_running_loop().create_future()
+                emit('snapshot_begin', 'fake-session', 1, in_flight)
+                emit('selection', 1, 0, 1, 'Fake concert', 'Set', 'In flight')
+                emit('snapshot_begin', 'fake-session', 2, overlapping)
+                self.assertEqual(live.result() if live.done() else None,
+                                 {'error': 'overlapping snapshot'} if 'live' in (in_flight, overlapping) else None,
+                                 'A pending refresh in either batch fails now instead of timing out')
+                # The rest of the overlapping batch is consumed without committing or further errors.
+                emit('selection', 2, 0, 2, 'Fake concert', 'Set', 'Overlapping')
+                emit('item', 1, 0, 2, 'Overlapping')
+                emit('snapshot_end', 'fake-session', 2, overlapping, 1)
+                self.assertIsNone(bridge.complete)
+                self.assertIsNone(bridge.transaction)
+                self.assertTrue(bridge.snapshot().stale)
+                self.assertEqual(bridge.snapshot().reason, 'overlapping snapshot')
+                bridge.responses.pop('live')
         # Preserved behavior: a delayed tagged reply over no transaction is consumed,
         # and an unsolicited begin over an ignored transaction still starts a fresh snapshot.
         done = asyncio.get_running_loop().create_future()
@@ -45,6 +50,60 @@ class FeedbackRecoveryTests(unittest.IsolatedAsyncioTestCase):
         emit('snapshot_end', 'fake-session', 2, '', 0)
         self.assertEqual(bridge.snapshot().selection.patch, 'Fresh')
         self.assertFalse(bridge.snapshot().stale)
+
+    async def test_overlapping_batch_from_the_helper_fails_the_pending_refresh_fast(self):
+        # On its second refresh the helper interleaves an unterminated batch with another one:
+        # 'tagged' puts the refresh reply over an unsolicited batch, 'unsolicited' the reverse.
+        fake = r'''
+import json,sys
+route = [['destination','Input',101,201,301,'com.apple.AppleMIDIIACDriver'],
+         ['source','Output',102,202,301,'com.apple.AppleMIDIIACDriver']]
+def emit(kind, *fields):
+    print(json.dumps(dict(kind=kind, fields=list(map(str,fields)))), flush=True)
+def batch(request, revision, label, end=True):
+    emit('snapshot_begin','fake-session',revision,request)
+    emit('selection',revision,0,revision,'Fake concert','Set',label)
+    emit('item',1,0,revision,label)
+    if end:
+        emit('snapshot_end','fake-session',revision,request,1)
+print(json.dumps(dict(kind='transport',connected=True,route=route)),flush=True)
+refreshes = 0
+for line in sys.stdin:
+    c=json.loads(line)
+    print(json.dumps(dict(kind='command_result',id=c['id'],ok=True,status=0)),flush=True)
+    if c['command']=='refresh':
+        refreshes += 1
+        emit('hello','MainStage',2,'fake-session','selection,patch_list,raw_midi_cc')
+        if refreshes != 2:
+            batch(c['id'], refreshes, 'Complete')
+        elif sys.argv[1] == 'tagged':
+            batch('', 2, 'Torn', end=False)
+            batch(c['id'], 2, 'Overlapping')
+        else:
+            batch(c['id'], 2, 'Torn', end=False)
+            batch('', 2, 'Overlapping')
+            emit('snapshot_end','fake-session',2,c['id'],1)
+'''
+        for mode in ('tagged', 'unsolicited'):
+            with self.subTest(mode=mode):
+                bridge = Bridge([sys.executable, '-u', '-c', fake, mode], 3)
+                await bridge.start()
+                try:
+                    initial = await bridge.refresh()
+                    with self.assertRaisesRegex(ToolError, '^overlapping snapshot$'):
+                        await bridge.refresh()
+                    # Receipts follow earlier feedback, so the whole overlapping batch has now been read.
+                    await bridge.send('cc', control=7, value=0, channel=1)
+                    state = bridge.snapshot()
+                    self.assertTrue(state.stale)
+                    self.assertEqual((state.revision, state.selection), (initial.revision, initial.selection),
+                                     'Neither overlapping batch may commit')
+                    self.assertFalse(bridge.responses)
+                    recovered = await bridge.refresh()
+                    self.assertFalse(recovered.stale)
+                    self.assertEqual(recovered.revision, 3)
+                finally:
+                    await bridge.close()
 
     async def test_goodbye_reinitialize_keeps_complete_snapshot_and_rejects_held_context(self):
         fake = FAKE.replace('revision, program = 1, 0', 'revision, program, refreshes = 1, 0, 0')
