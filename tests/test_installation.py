@@ -328,6 +328,34 @@ class InstallationTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(list(self.root.iterdir()), [])
 
+    def test_manifest_records_bytes_on_disk_or_is_refused(self):
+        target = self.root / "Apple Inc/Sterownik IAC.device/config.lua"
+        data = setup.render(self.template, "MS Bridge Input", "MS Bridge Output", "Apple Inc", "Sterownik IAC")
+        calls = []
+
+        def listing(bridge):
+            calls.append(bridge)
+            if len(calls) == 2:  # the recheck between publishing the profile and recording it
+                target.write_bytes(b"swapped by another process")
+            return rows()
+        for adopted in (True, False):
+            with self.subTest(adopted=adopted):
+                self.reset()
+                if adopted:
+                    target.parent.mkdir(parents=True)
+                    target.write_bytes(data)
+                calls.clear()
+                self.listing.side_effect = listing
+                with self.assertRaisesRegex(ValueError, "changed during installation"):
+                    setup.install(**self.options)
+                self.assertFalse(self.state.exists())
+                self.assertEqual(target.read_bytes(), b"swapped by another process")
+                self.listing.side_effect = None
+                self.assertEqual(setup.uninstall(self.state, self.root),
+                                 {"uninstalled": True, "changed": False} if adopted
+                                 else {"uninstalled": False, "preserved_changed_file": str(target)})
+                self.assertEqual(target.read_bytes(), b"swapped by another process")
+
     def test_crash_residue_is_rolled_back_by_install_or_uninstall(self):
         context = multiprocessing.get_context("spawn")
         directory = self.root / "Apple Inc/Sterownik IAC.device"

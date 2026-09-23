@@ -314,6 +314,8 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
                 write_exclusive(target, data)
             if identity(endpoints(bridge)) != identity(before):
                 raise ValueError("MIDI identities changed during installation; profile rolled back")
+            if not target.is_file() or digest(target.read_bytes()) != manifest["sha256"]:
+                raise ValueError("Profile changed during installation; refusing to record it")
             write_exclusive(state, encoded)
             state_created = True
         except BaseException:
