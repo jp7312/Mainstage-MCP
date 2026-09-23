@@ -4,8 +4,9 @@ import Darwin
 
 // MIDI 1.0 packet APIs match MainStage's Lua byte tables. All limits include wire bytes.
 let maximumFrame = 65536
-// Stdin lines (commands and --decode-hex) share the contract's 4096-byte command bound.
-let maximumLine = 4096
+// Stdin command lines share the contract's 4096-byte command bound. --decode-hex tokens are exactly
+// two hex digits, so a maximum frame fits one line at 3 bytes per frame byte (single separators, CR).
+let maximumLine = 4096, maximumHexLine = 3 * maximumFrame
 // The stdout backlog counts JSON bytes, about 2x profile.lua wire bytes at worst (\u00XX, \", \\, \/).
 // A timer batch (hello with a 1024-byte application, one replayed parameter frame, markers with 64-byte
 // ids, a MAX_TOTAL - 1024 snapshot of 4096 items) is < 8.2 MiB of JSON (--self-test builds it). The
@@ -107,14 +108,15 @@ func hexByte(_ text: String) -> UInt8? {
     return high << 4 | low
 }
 // Bounded stdin line reader shared by the command loop and --decode-hex; unlike readLine(),
-// it never buffers more than maximumLine bytes.
+// it never buffers more than limit bytes.
 struct LineReader {
+    var limit = maximumLine
     var line = Data()
     var oversized = false
     // Returns true when byte terminates a line; oversized lines drain without buffering.
     mutating func accept(_ byte: UInt8) -> Bool {
         if byte != 10 {
-            if line.count < maximumLine { line.append(byte) } else { oversized = true }
+            if line.count < limit { line.append(byte) } else { oversized = true }
             return false
         }
         return true
@@ -133,11 +135,11 @@ func readByte() -> UInt8? {
 // Feeds each newline-terminated line — plus a trailing unterminated line at EOF — through consume;
 // consume returns false to stop reading early (quit). Oversized lines pass the drain flag instead
 // of their contents.
-func readLines(_ consume: (Data, Bool) -> Bool) {
-    var reader = LineReader()
+func readLines(_ limit: Int, _ next: () -> UInt8?, _ consume: (Data, Bool) -> Bool) {
+    var reader = LineReader(limit: limit)
     var stopped = false
     while !stopped {
-        guard let byte = readByte() else { break }
+        guard let byte = next() else { break }
         guard reader.accept(byte) else { continue }
         stopped = !consume(reader.line, reader.oversized)
         reader.reset()
@@ -145,6 +147,18 @@ func readLines(_ consume: (Data, Bool) -> Bool) {
     guard !stopped, !reader.line.isEmpty || reader.oversized else { return }
     _ = consume(reader.line, reader.oversized)
     reader.reset()
+}
+// Returns false on an oversized line, a token that is not two hex digits, or a foreign-frame tail.
+func decodeHex(_ next: () -> UInt8?, emit: ([String: Any]) -> Void) -> Bool {
+    var parser = SysExParser(), valid = true
+    readLines(maximumHexLine, next) { line, oversized in
+        let parts = String(decoding: line, as: UTF8.self).split(whereSeparator: { $0.isWhitespace })
+        let bytes = parts.compactMap { hexByte(String($0)) }
+        valid = !oversized && bytes.count == parts.count
+        if valid { parser.feed(bytes, emit: emit) }
+        return valid
+    }
+    return valid && decodableTail(parser.pending)
 }
 func stringProperty(_ object: MIDIObjectRef, _ property: CFString) -> String {
     var value: Unmanaged<CFString>?
@@ -254,6 +268,15 @@ func selfTest() {
     // A capture ending before the MSP2 marker byte is rejected; 7D-prefixed truncation is not.
     precondition(decodableTail(nil) && decodableTail([0x7D, 0x4D]))
     precondition(!decodableTail([]) && !decodableTail([0x41, 0x06]))
+    // --decode-hex takes a maximum frame on one line.
+    func decoded(_ text: String) -> Int? {
+        var bytes = Array(text.utf8)[...], count = 0
+        return decodeHex({ bytes.popFirst() }, emit: { _ in count += 1 }) ? count : nil
+    }
+    let maximal = replay.map { String(format: "%02X", $0) }.joined(separator: " ")
+    precondition(decoded(maximal + "\r\n") == 1 && decoded(maximal + " 00") == nil)
+    for text in ["", "F0 7D", "F0 7D 4D"] { precondition(decoded(text) == 0) }
+    for text in ["F0 41 06", "F0 f", "7D0"] { precondition(decoded(text) == nil) }
     // Line reader stays bounded and flags oversized lines instead of buffering past maximumLine.
     var reader = LineReader()
     for byte in Array("ok".utf8) { precondition(!reader.accept(byte)) }
@@ -269,29 +292,21 @@ func selfTest() {
                                       ["name": "", "display_name": "Bus", "unique_id": Int32(0)],
                                       ["name": "", "display_name": "", "unique_id": Int32(7)]]
     for info in surviving { precondition(usableRoute(info)) }
-    json(["self_test":"passed", "checks":"fragmentation, realtime, unicode, malformed input, frame bound, strict commands, correlation, timer burst backlog, hex tokens, bounded lines, list rows"])
+    json(["self_test":"passed", "checks":"fragmentation, realtime, unicode, malformed input, frame bound, strict commands, correlation, timer burst backlog, hex tokens, hex frames, bounded lines, list rows"])
 }
 
 func run() {
     let args = Array(CommandLine.arguments.dropFirst())
     if args == ["--self-test"] { selfTest(); return }
     if args == ["--decode-hex"] {
-        var parser = SysExParser()
-        readLines { line, oversized in
-            guard !oversized else { fatal("Invalid hex input") }
-            let parts = String(decoding: line, as: UTF8.self).split(whereSeparator: { $0.isWhitespace })
-            let bytes = parts.compactMap { hexByte(String($0)) }
-            guard bytes.count == parts.count else { fatal("Invalid hex input") }
-            parser.feed(bytes, emit: json)
-            return true
-        }
-        guard decodableTail(parser.pending) else { fatal("Invalid hex input") }
+        guard decodeHex(readByte, emit: json) else { fatal("Invalid hex input") }
         return
     }
     let loopback = args == ["--loopback-self-test"]
     let iac = args.count == 4 && args[0] == "--iac-input" && args[2] == "--iac-output" && !args[1].isEmpty && !args[3].isEmpty && args[1] != args[3]
     guard args == ["--list"] || loopback || iac else {
-        log("Usage: bridge --list | --self-test | --decode-hex | --loopback-self-test | --iac-input NAME --iac-output DIFFERENT_NAME"); exit(2)
+        log("Usage: bridge --list | --self-test | --decode-hex | --loopback-self-test | --iac-input NAME --iac-output DIFFERENT_NAME")
+        log("--decode-hex reads stdin lines of whitespace-separated two-digit hex bytes, at most \(maximumHexLine) bytes each"); exit(2)
     }
     let routeLock = NSLock(); var connected = false
     var client: MIDIClientRef = 0
@@ -373,7 +388,7 @@ func run() {
           "route":[routeIdentity(first), routeIdentity(second)]])
     // Bounded reader with the same line discipline for every input, including a trailing
     // unterminated line at EOF, which still gets one validate/parse pass.
-    readLines { line, oversized in
+    readLines(maximumLine, readByte) { line, oversized in
         guard !oversized, let request = command(line) else {
             let object = (try? JSONSerialization.jsonObject(with:line)) as? [String:Any]
             json(["kind":"command_result", "id":token(object?["id"]) ?? "", "ok":false, "status":-50, "error":"Invalid command (4096-byte limit; strict JSON fields and integer ranges)"])
