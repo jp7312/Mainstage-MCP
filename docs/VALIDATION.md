@@ -46,6 +46,15 @@ The helper refreshes and checks the exact concert name but sends no mutation by 
 
 The original 35 Python tests, Lua profile harness, native parser self-test and CoreMIDI loopback passed on macOS 26.6.2 (25G83), arm64, Python 3.12.13, MCP SDK 2.2.0, Swift 6.3.3 and Lua 5.5.1. The isolated driver build also passed its bundle-loader, ABI/routing and mock lifecycle checks; it was not installed. This initial stage supplied offline evidence; the subsequent live pass is recorded below.
 
+Update 2026-09-23: MainStage 4.3.1 (5233) embeds Lua 5.2, not the Lua 5.5.1 used by this harness run. Its universal `LogicMainStage` framework binary contains the `Lua 5.2` version string plus `_ENV` and `bit32`, which Lua 5.1 lacks, and neither of Lua 5.1's `setfenv` or `loadstring`. Re-check with the command below; this Mac printed `Lua 5.2`, `_ENV` and `bit32`, each twice (once per architecture slice):
+
+```sh
+strings -a /Applications/MainStage.app/Contents/Frameworks/LogicMainStage.framework/Versions/A/LogicMainStage \
+  | grep -xE 'Lua 5\.[0-9]+|_ENV|bit32|setfenv|loadstring' | sort | uniq -c
+```
+
+The profile stays Lua 5.1-compatible for older hosts. Hosted CI runs the Lua harness under Ubuntu's Lua 5.1 and 5.2 packages in addition to Homebrew's Lua 5.5 on macOS.
+
 Recovery regressions exposed two defects: cancellation during reconnect could leave its helper running, and expired tagged snapshot replies could replace cached state. Reconnect now closes the owned helper on cancellation. Tagged snapshots require a pending refresh request before they can commit. Added synthetic checks cover cancellation during teardown/readiness/refresh, delayed replies around reconnect and requests expiring mid-snapshot, host goodbye/reinitialization, unchanged-route recovery after a topology notification, and mapped callback replay retaining its original observation time and stale connection scope. The integrated `make test` passes all 40 Python tests plus the Lua and native self-checks; `pip check` reports no broken requirements.
 
 The smoke client now accepts `--reconnect` to restart only its owned helper once, requiring fresh responsive state for the same concert and a changed nonempty session before any optional Program Changes:
