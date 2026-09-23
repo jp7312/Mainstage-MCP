@@ -38,3 +38,10 @@ version = {attr = "mainstage_mcp.__version__"}
 
 [tool.setuptools.package-data]
 mainstage_mcp = ["profile.lua"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]

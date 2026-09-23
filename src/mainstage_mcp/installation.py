@@ -1,23 +1,25 @@
 """Owned profile installation. Never creates, renames, or changes MIDI devices."""
 import argparse
-from contextlib import contextmanager
 import fcntl
 import hashlib
-from importlib.resources import files
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import tempfile
 import unicodedata
+from contextlib import contextmanager
+from importlib.resources import files
+from pathlib import Path
 
 PROFILE_ROOT = Path.home() / "Music/Audio Music Apps/MIDI Device Profiles"
 STATE = Path.home() / "Library/Application Support/MainStage MCP/installation.json"
 DRIVER = "com.apple.AppleMIDIIACDriver"
-SYSTEM_PROFILE_ROOTS = (Path("/Library/Audio/MIDI Device Profiles"), Path("/Library/Application Support/Logic/MIDI Device Profiles"))
+SYSTEM_PROFILE_ROOTS = (Path("/Library/Audio/MIDI Device Profiles"),
+                        Path("/Library/Application Support/Logic/MIDI Device Profiles"))
 # Object handles can change between processes; persistent MIDI IDs cannot.
-ENDPOINT_KEYS = ("direction", "name", "unique_id", "entity_unique_id", "device_unique_id", "device_name", "manufacturer", "model", "driver_owner")
+ENDPOINT_KEYS = ("direction", "name", "unique_id", "entity_unique_id", "device_unique_id", "device_name",
+                 "manufacturer", "model", "driver_owner")
 
 
 def safe_path(value):
@@ -29,7 +31,8 @@ def safe_path(value):
 
 
 def component(value):
-    if not isinstance(value, str) or not value.strip() or value in (".", "..") or any(c in value for c in "/\\\x00\r\n"):
+    if (not isinstance(value, str) or not value.strip() or value in (".", "..")
+            or any(c in value for c in "/\\\x00\r\n")):
         raise ValueError("Unsafe or missing device metadata")
     return value
 
@@ -68,7 +71,9 @@ def endpoints(bridge):
 
 
 def identity(rows):
-    return sorted([{key: row.get(key) for key in ENDPOINT_KEYS} for row in rows], key=lambda row: json.dumps(row, sort_keys=True))
+    # Object handles can change between processes; persistent MIDI IDs cannot.
+    return sorted([{key: row.get(key) for key in ENDPOINT_KEYS} for row in rows],
+                  key=lambda row: json.dumps(row, sort_keys=True))
 
 
 def select_device(rows, input_name, output_name):
@@ -79,14 +84,19 @@ def select_device(rows, input_name, output_name):
         for direction in ("source", "destination"):
             matches = [row for row in rows if row.get("name") == name and row.get("direction") == direction]
             if len(matches) != 1:
-                raise ValueError(f"Expected one {direction} named {name!r}; found {len(matches)}. Create dedicated IAC buses manually; installation never edits MIDI setup.")
+                raise ValueError(
+                    f"Expected one {direction} named {name!r}; found {len(matches)}."
+                    " Create dedicated IAC buses manually; installation never edits MIDI setup.")
             row = matches[0]
-            if row.get("driver_owner") != DRIVER or not row.get("entity") or not row.get("entity_unique_id") or not row.get("device") or not row.get("unique_id") or not row.get("device_unique_id"):
+            if (row.get("driver_owner") != DRIVER or not row.get("entity") or not row.get("entity_unique_id")
+                    or not row.get("device") or not row.get("unique_id") or not row.get("device_unique_id")):
                 raise ValueError(f"{name!r} is not an identified Apple IAC device")
             chosen.append(row)
-        if chosen[-1]["entity"] != chosen[-2]["entity"] or chosen[-1]["entity_unique_id"] != chosen[-2]["entity_unique_id"]:
+        if chosen[-1]["entity"] != chosen[-2]["entity"] \
+                or chosen[-1]["entity_unique_id"] != chosen[-2]["entity_unique_id"]:
             raise ValueError(f"The source and destination named {name!r} must belong to the same IAC bus")
-    if chosen[0]["entity"] == chosen[2]["entity"] or chosen[0]["entity_unique_id"] == chosen[2]["entity_unique_id"] or len({row["unique_id"] for row in chosen}) != 4:
+    if (chosen[0]["entity"] == chosen[2]["entity"] or chosen[0]["entity_unique_id"] == chosen[2]["entity_unique_id"]
+            or len({row["unique_id"] for row in chosen}) != 4):
         raise ValueError("Dedicated buses must have distinct bus and endpoint identities")
     if len({row["device_unique_id"] for row in chosen}) != 1 or len({row["device"] for row in chosen}) != 1:
         raise ValueError("Dedicated buses must belong to the same IAC device")
@@ -99,7 +109,8 @@ def select_device(rows, input_name, output_name):
 
 
 def lua_literal(value):
-    return '"' + ''.join(f"\\{byte:03d}" for byte in value.encode("utf-8")) + '"'
+    escaped = ''.join(f"\\{byte:03d}" for byte in value.encode("utf-8"))
+    return '"' + escaped + '"'
 
 
 def render(template, input_name, output_name, manufacturer, model,
@@ -107,7 +118,8 @@ def render(template, input_name, output_name, manufacturer, model,
     if type(experimental_actions) is not bool or type(experimental_mapped_parameter) is not bool:
         raise ValueError("experimental flags must be booleans")
     text = Path(template).read_text()
-    for key, value in (("INPUT", input_name), ("OUTPUT", output_name), ("MANUFACTURER", manufacturer), ("MODEL", model)):
+    for key, value in (("INPUT", input_name), ("OUTPUT", output_name),
+                       ("MANUFACTURER", manufacturer), ("MODEL", model)):
         token = f"__MS_{key}__"
         if token not in text:
             raise ValueError(f"Profile template missing {token}")
@@ -127,16 +139,20 @@ def read_manifest(state, root):
     try:
         value = json.loads(state.read_text())
     except json.JSONDecodeError as error:
-        raise ValueError(f"Corrupt installation manifest {state.name} ({error}); remove {state.name} and the profile it describes, then reinstall") from error
+        raise ValueError(f"Corrupt installation manifest {state.name} ({error}); remove {state.name}"
+                         " and the profile it describes, then reinstall") from error
     if not isinstance(value, dict):
-        raise ValueError(f"Corrupt installation manifest {state.name}; remove {state.name} and the profile it describes, then reinstall")
+        raise ValueError(f"Corrupt installation manifest {state.name}; remove {state.name}"
+                         " and the profile it describes, then reinstall")
     for field in ("profile_root", "file", "input", "output"):
         if not isinstance(value.get(field), str) or not value[field].strip():
             raise ValueError(f"Installation manifest field {field!r} must be a nonempty string")
     if type(value.get("version")) is not int:
         raise ValueError("Installation manifest field 'version' must be an integer")
-    if not isinstance(value.get("endpoints"), list) or any(not isinstance(row, dict) or not set(ENDPOINT_KEYS) <= row.keys() for row in value["endpoints"]):
-        raise ValueError("Installation manifest field 'endpoints' must be a list of endpoint objects with keys " + ", ".join(ENDPOINT_KEYS))
+    if (not isinstance(value.get("endpoints"), list)
+            or any(not isinstance(row, dict) or not set(ENDPOINT_KEYS) <= row.keys() for row in value["endpoints"])):
+        raise ValueError("Installation manifest field 'endpoints' must be a list of endpoint objects with keys "
+                         + ", ".join(ENDPOINT_KEYS))
     if not isinstance(value.get("sha256"), str) or not re.fullmatch("[0-9a-f]{64}", value["sha256"]):
         raise ValueError("Installation manifest field 'sha256' must be 64 lowercase hex characters")
     if value["version"] != 1 or value["profile_root"] != str(root):
@@ -195,8 +211,8 @@ def conflicts(root, manufacturer, model, owned=None, device_names=()):
     return sorted(found)
 
 
-def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output", profile_root=PROFILE_ROOT, state=STATE, template=None,
-            experimental_actions=False, experimental_mapped_parameter=False):
+def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output", profile_root=PROFILE_ROOT,
+            state=STATE, template=None, experimental_actions=False, experimental_mapped_parameter=False):
     root, state = safe_path(profile_root), safe_path(state)
     with locked(state):
         before = endpoints(bridge)
@@ -228,7 +244,8 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
             return {"installed": True, "changed": False, "file": str(target),
                     "experimental_actions": experimental_actions,
                     "experimental_mapped_parameter": experimental_mapped_parameter}
-        manifest = {"version": 1, "profile_root": str(root), "file": str(target), "sha256": digest(data), "input": input_name, "output": output_name,
+        manifest = {"version": 1, "profile_root": str(root), "file": str(target), "sha256": digest(data),
+                    "input": input_name, "output": output_name,
                     "experimental_actions": experimental_actions,
                     "experimental_mapped_parameter": experimental_mapped_parameter,
                     "endpoints": identity(before), "bridge": str(Path(bridge).expanduser().resolve())}
@@ -283,8 +300,11 @@ def uninstall(state=STATE, profile_root=PROFILE_ROOT):
         return {"uninstalled": True, "changed": True}
 
 
-def doctor(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output", profile_root=PROFILE_ROOT, state=STATE):
-    result = {"read_only": True, "runtime_handshake_tested": False, "mainstage_app_found": any(path.exists() for path in (Path("/Applications/MainStage.app"), Path.home() / "Applications/MainStage.app")), "issues": []}
+def doctor(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output",
+           profile_root=PROFILE_ROOT, state=STATE):
+    mainstage_paths = (Path("/Applications/MainStage.app"), Path.home() / "Applications/MainStage.app")
+    result = {"read_only": True, "runtime_handshake_tested": False,
+              "mainstage_app_found": any(path.exists() for path in mainstage_paths), "issues": []}
     try:
         rows = endpoints(bridge)
         manufacturer, model = select_device(rows, input_name, output_name)
@@ -301,7 +321,9 @@ def doctor(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output",
             if identity(rows) != manifest["endpoints"]:
                 result["issues"].append("MIDI endpoint identities changed since installation")
         device_names = {row["device_name"] for row in rows if row.get("name") in (input_name, output_name)}
-        result["issues"].extend("Conflicting profile: " + path for path in conflicts(profile_root, manufacturer, model, Path(manifest["file"]) if manifest else None, device_names))
+        owned = Path(manifest["file"]) if manifest else None
+        result["issues"].extend("Conflicting profile: " + path
+                                for path in conflicts(profile_root, manufacturer, model, owned, device_names))
     except (ValueError, OSError, subprocess.SubprocessError, KeyError) as exc:
         result["issues"].append(str(exc))
     if not result["mainstage_app_found"]:
@@ -330,10 +352,14 @@ def main(argv=None):
         else:
             if args.bridge is None:
                 parser.error("--bridge is required for install and doctor")
-            options = dict(bridge=args.bridge, input_name=args.input, output_name=args.output, profile_root=args.profile_root, state=args.state)
-            result = install(**options, template=args.template,
-                             experimental_actions=args.experimental_actions,
-                             experimental_mapped_parameter=args.experimental_mapped_parameter) if args.command == "install" else doctor(**options)
+            options = dict(bridge=args.bridge, input_name=args.input, output_name=args.output,
+                           profile_root=args.profile_root, state=args.state)
+            if args.command == "install":
+                result = install(**options, template=args.template,
+                                 experimental_actions=args.experimental_actions,
+                                 experimental_mapped_parameter=args.experimental_mapped_parameter)
+            else:
+                result = doctor(**options)
         print(json.dumps(result, indent=2))
         return 1 if result.get("issues") or result.get("uninstalled") is False else 0
     except (ValueError, OSError, subprocess.SubprocessError, KeyError) as exc:

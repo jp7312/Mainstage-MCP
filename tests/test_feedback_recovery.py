@@ -4,8 +4,9 @@ import sys
 import unittest
 
 from mcp.server.mcpserver.exceptions import ToolError
-from mainstage_mcp.server import Bridge
 from test_server import FAKE, PARAM_FAKE
+
+from mainstage_mcp.server import Bridge
 
 
 class FeedbackRecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -147,7 +148,8 @@ class FeedbackRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('connection session changed', recovered.mapped_parameter.reason)
 
             snapshot(expired_request, 2, 1, 'Delayed')
-            self.assertEqual(bridge.snapshot(), recovered, 'A late tagged snapshot cannot replace or stale recovered state')
+            self.assertEqual(bridge.snapshot(), recovered,
+                             'A late tagged snapshot cannot replace or stale recovered state')
             snapshot('', 4, 3, 'Unsolicited')
             self.assertEqual(bridge.snapshot().selection.patch, 'Unsolicited')
             complete = bridge.complete

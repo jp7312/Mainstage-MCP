@@ -1,13 +1,14 @@
 """Synthetic subprocess coverage for the opt-in live recovery check."""
 import json
-from types import SimpleNamespace
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from mainstage_mcp.server import Bridge
 import live_recovery_check
 from test_server import FAKE
+
+from mainstage_mcp.server import Bridge
 
 
 class LiveRecoveryCheckTests(unittest.IsolatedAsyncioTestCase):

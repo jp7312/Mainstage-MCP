@@ -213,7 +213,8 @@ class Bridge:
         if kind == 'hello':
             self.profile_seen = False
             self.capabilities = []
-        if kind not in counts or not isinstance(fields, list) or len(fields) != counts[kind] or not all(isinstance(f, str) for f in fields):
+        if (kind not in counts or not isinstance(fields, list) or len(fields) != counts[kind]
+                or not all(isinstance(f, str) for f in fields)):
             raise ValueError('invalid feedback event')
         if sum(len(f.encode('utf-8')) for f in fields) > 65536:
             raise ValueError('feedback frame too large')
@@ -243,7 +244,8 @@ class Bridge:
         elif kind == 'parameter':
             if 'mapped_parameter_1' not in self.capabilities or fields[0] != self.session:
                 raise ValueError('parameter feedback without matching capability/session')
-            if fields[3] != 'mapped_parameter_1' or fields[5:8] != ['0', '127', 'midi_7bit'] or fields[10] != 'screen_control_feedback':
+            if (fields[3] != 'mapped_parameter_1' or fields[5:8] != ['0', '127', 'midi_7bit']
+                    or fields[10] != 'screen_control_feedback'):
                 raise ValueError('unsupported parameter mapping')
             value = dict(id=fields[3], session=fields[0],
                          selectionRevision=number(fields[1], 0, 2**53 - 1),
@@ -299,7 +301,8 @@ class Bridge:
                 if len(tx['items']) >= 4096 or fields[0] not in ('0', '1'):
                     raise ValueError('invalid/excess snapshot item')
                 tx['items'].append(dict(isPatch=fields[0] == '1',
-                    setIndex=number(fields[1], -1, 2**31-1), patchIndex=number(fields[2], -1, 2**31-1), label=fields[3]))
+                    setIndex=number(fields[1], -1, 2**31-1),
+                    patchIndex=number(fields[2], -1, 2**31-1), label=fields[3]))
             else:
                 future = self.responses.get(tx['request'])
                 if tx['request'] and (future is None or future.done()):
@@ -421,9 +424,10 @@ class Bridge:
                             await self.send('cc', control=action_binding[1], value=value, channel=16)
                             confirmed += 1
                         experimental = action != 'metronome'
+                        press_note = f'{"Experimental " if experimental else ""}{action_binding[2]} press/release sent'
                         return dict(action=action, experimental=experimental, sent=True, observed=False,
                                     messages_confirmed=confirmed,
-                                    note=f'{"Experimental " if experimental else ""}{action_binding[2]} press/release sent; action result is not confirmed.')
+                                    note=press_note + '; action result is not confirmed.')
                     if command == 'set_mapped_parameter_1':
                         receipt = await self.send('cc', control=90, value=values['value'], channel=16)
                     elif command == 'bank_pc':
@@ -446,9 +450,10 @@ class Bridge:
                     while True:
                         await self.send('refresh')
                         result = self.complete  # Include any newer unsolicited snapshot already read.
-                        context_changed = (result['client_session'] != expected_session or
-                                           result['selection']['concert'] != current['selection']['concert'] or
-                                           (command == 'set_mapped_parameter_1' and result['revision'] != expected_revision))
+                        context_changed = (result['client_session'] != expected_session
+                                           or result['selection']['concert'] != current['selection']['concert']
+                                           or (command == 'set_mapped_parameter_1'
+                                               and result['revision'] != expected_revision))
                         if context_changed:
                             self.invalidate('concert or profile session changed while awaiting selection')
                             if command == 'bank_pc':
@@ -472,18 +477,20 @@ class Bridge:
                                 return dict(sent=True, observed=True, context_changed=False,
                                             feedback='mapped_screen_control', midi_status=receipt['status'],
                                             state=self.snapshot().model_dump(),
-                                            note='A newer matching screen-control callback was observed; underlying plug-in effect is not proven.')
+                                            note=('A newer matching screen-control callback was'
+                                                  ' observed; underlying plug-in effect is not proven.'))
                             self.invalidate('awaiting newer mapped screen-control feedback')
                             await asyncio.sleep(.05)
                             continue
                         if result['selection']['program'] == values['program']:
                             if command == 'bank_pc':
+                                note = ('A fresh selection callback matched the program; MainStage does not report'
+                                        ' the selected bank, so the bank/program target is not fully observed.')
                                 return dict(sent=True, observed=False, program_observed=True,
                                             bank_observed=False, context_changed=False,
                                             messages_attempted=attempted_messages,
                                             messages_confirmed=confirmed, midi_statuses=statuses,
-                                            state=self.snapshot().model_dump(),
-                                            note='A fresh selection callback matched the program; MainStage does not report the selected bank, so the bank/program target is not fully observed.')
+                                            state=self.snapshot().model_dump(), note=note)
                             return dict(sent=True, observed=True, context_changed=False,
                                         midi_status=receipt['status'], state=self.snapshot().model_dump())
                         # Host patch loading may lag MIDI delivery. Poll feedback only;
@@ -517,7 +524,8 @@ class Bridge:
                             timed_out=isinstance(error, TimeoutError),
                             error=str(error) or 'bank/program selection timed out',
                             state=self.snapshot().model_dump(),
-                            note='Do not automatically retry: the bank/program sequence or its observation may be partial.')
+                            note=('Do not automatically retry: the bank/program sequence'
+                                  ' or its observation may be partial.'))
             if sent:
                 return dict(sent=True, observed=False, timed_out=isinstance(error, TimeoutError),
                             error=str(error) or 'feedback timed out', state=self.snapshot().model_dump())
@@ -584,51 +592,66 @@ def create_server(bridge: Bridge) -> MCPServer:
 
     @server.tool(annotations={'readOnlyHint': True})
     async def mainstage_list_patches() -> State:
-        """Read cached patch/set list with its session, revision and stale metadata. Indices are not MIDI program numbers."""
+        ("Read cached patch/set list with its session, revision and stale metadata."
+         " Indices are not MIDI program numbers.")
         return bridge.snapshot()
 
     @server.tool(annotations={'readOnlyHint': True})
     async def mainstage_refresh() -> State:
-        """Request a correlated snapshot with a deadline, proving profile responsiveness. Names remain callback-derived."""
+        ("Request a correlated snapshot with a deadline, proving profile responsiveness."
+         " Names remain callback-derived.")
         return await bridge.refresh()
 
     @server.tool(annotations={'readOnlyHint': True})
     async def mainstage_reconnect() -> State:
-        """Explicitly restart the native helper on its pinned endpoint identities, then refresh. Never replay a mutation."""
+        ("Explicitly restart the native helper on its pinned endpoint identities, then refresh."
+         " Never replay a mutation.")
         return await bridge.reconnect()
 
     @server.tool()
-    async def mainstage_select_program(program: MidiByte, expected_session: Session, expected_revision: Revision, channel: Channel = 1) -> dict:
-        """Select the assigned MIDI program (0–127), not a list index. Require last-read session/revision; report MIDI sent separately from observed selection."""
+    async def mainstage_select_program(program: MidiByte, expected_session: Session, expected_revision: Revision,
+                                       channel: Channel = 1) -> dict:
+        ("Select the assigned MIDI program (0–127), not a list index."
+         " Require last-read session/revision; report MIDI sent separately from observed selection.")
         return await bridge.mutate('pc', expected_session, expected_revision, program=program, channel=channel)
 
     @server.tool()
     async def mainstage_select_bank_program(bank_msb: MidiByte, bank_lsb: MidiByte, program: MidiByte,
                                             expected_session: Session, expected_revision: Revision,
                                             channel: Channel = 1) -> dict:
-        """Send Bank Select MSB, LSB, then Program Change once. MainStage assignments determine the result; bank state cannot be observed."""
+        ("Send Bank Select MSB, LSB, then Program Change once. MainStage assignments determine the result;"
+         " bank state cannot be observed.")
         return await bridge.mutate('bank_pc', expected_session, expected_revision,
                                    bank_msb=bank_msb, bank_lsb=bank_lsb,
                                    program=program, channel=channel)
 
     @server.tool()
-    async def mainstage_send_cc(control: MidiByte, value: MidiByte, expected_session: Session, expected_revision: Revision, channel: Channel = 1) -> dict:
-        """Advanced raw MIDI CC. Mapping determines effect; no action completion or parameter feedback is available. Requires last-read session/revision."""
-        return await bridge.mutate('cc', expected_session, expected_revision, control=control, value=value, channel=channel)
+    async def mainstage_send_cc(control: MidiByte, value: MidiByte, expected_session: Session,
+                                expected_revision: Revision, channel: Channel = 1) -> dict:
+        ("Advanced raw MIDI CC. Mapping determines effect; no action completion or parameter feedback is"
+         " available. Requires last-read session/revision.")
+        return await bridge.mutate('cc', expected_session, expected_revision,
+                                   control=control, value=value, channel=channel)
 
     @server.tool()
     async def mainstage_toggle_metronome(expected_session: Session, expected_revision: Revision) -> dict:
-        """Toggle metronome using a profile-advertised binding. Sends one press/release; no metronome on/off state or action completion feedback exists. Never automatically retry."""
+        ("Toggle metronome using a profile-advertised binding. Sends one press/release; no metronome on/off"
+         " state or action completion feedback exists. Never automatically retry.")
         return await bridge.mutate('toggle_metronome', expected_session, expected_revision)
 
     @server.tool()
-    async def mainstage_trigger_action(action: ActionName, expected_session: Session, expected_revision: Revision) -> dict:
-        """Trigger one profile-advertised named action. Non-metronome names are experimental. Sends one press/release and reports MIDI transport only; no action result or state is observed. Never automatically retry."""
+    async def mainstage_trigger_action(action: ActionName, expected_session: Session,
+                                       expected_revision: Revision) -> dict:
+        ("Trigger one profile-advertised named action. Non-metronome names are experimental. Sends one"
+         " press/release and reports MIDI transport only; no action result or state is observed."
+         " Never automatically retry.")
         return await bridge.mutate('action', expected_session, expected_revision, action=action)
 
     @server.tool()
-    async def mainstage_set_mapped_parameter_1(value: MidiByte, expected_session: Session, expected_revision: Revision) -> dict:
-        """Experimental opt-in CC90 slot. Observe only a newer matching screen-control callback; never claim plug-in enumeration or effect."""
+    async def mainstage_set_mapped_parameter_1(value: MidiByte, expected_session: Session,
+                                               expected_revision: Revision) -> dict:
+        ("Experimental opt-in CC90 slot. Observe only a newer matching screen-control callback;"
+         " never claim plug-in enumeration or effect.")
         return await bridge.mutate('set_mapped_parameter_1', expected_session, expected_revision, value=value)
 
     return server

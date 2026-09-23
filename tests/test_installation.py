@@ -1,13 +1,13 @@
 """Installer checks use isolated directories and fake read-only bridge output."""
-from contextlib import redirect_stdout
 import copy
 import io
 import json
 import multiprocessing
-from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 from mainstage_mcp import installation as setup
@@ -45,7 +45,8 @@ class InstallationTests(unittest.TestCase):
             ["local " + key + " = __MS_" + key + "__" for key in ("INPUT", "OUTPUT", "MANUFACTURER", "MODEL")]
             + ["local actions = __MS_EXPERIMENTAL_ACTIONS__",
                "local parameter = __MS_EXPERIMENTAL_PARAMETER__"]))
-        self.options = dict(bridge=self.base / "bridge", profile_root=self.root, state=self.state, template=self.template)
+        self.options = dict(bridge=self.base / "bridge", profile_root=self.root, state=self.state,
+                            template=self.template)
         self.listing = patch.object(setup, "endpoints", return_value=rows()).start()
         self.addCleanup(patch.stopall)
 
