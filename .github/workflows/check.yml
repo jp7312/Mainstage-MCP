@@ -39,7 +39,7 @@ jobs:
       - name: Run offline checks
         run: make test
       - name: Install ruff
-        run: .venv/bin/python -m pip install ruff
+        run: .venv/bin/python -m pip install ruff==0.16.8
       - name: Run lint
         run: make lint RUFF=.venv/bin/ruff
       # CoreMIDI loopback and MainStage round trips are separate local checks.
