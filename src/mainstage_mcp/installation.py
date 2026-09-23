@@ -184,30 +184,36 @@ def locked(state):
 def conflicts(root, manufacturer, model, owned=None, device_names=()):
     found = []
     candidates = {canonical(name) for name in (model, *device_names)}
-    for foreign, base in ((False, safe_path(root)), *((True, path) for path in SYSTEM_PROFILE_ROOTS)):
+    bases = [(False, safe_path(root))]
+    for base in SYSTEM_PROFILE_ROOTS:
+        try:
+            bases.append((True, safe_path(base)))
+        except ValueError:
+            pass  # A symlinked system root is foreign territory we cannot inspect; skip it instead of aborting.
+    for foreign, base in bases:
         if not base.exists():
             continue
         for maker in base.iterdir():
             if canonical(maker.name) != canonical(manufacturer):
                 continue
-            try:
-                safe_path(maker)
-                if not maker.is_dir():
-                    found.append(str(maker))
-                    continue
-                for directory in maker.iterdir():
+            safe_path(maker)
+            if not maker.is_dir():
+                found.append(str(maker))
+                continue
+            for directory in maker.iterdir():
+                try:
                     name = normalized_component(directory.name)
-                    if not name.casefold().endswith(".device") or canonical(name[:-7]) not in candidates:
-                        continue
-                    safe_path(directory)
-                    if owned is None or directory != owned.parent or not directory.is_dir():
-                        found.append(str(directory))
-                        continue
-                    found.extend(str(path) for path in directory.rglob("*") if path != owned)
-            except ValueError:
-                # A symlinked system root is foreign territory we cannot inspect; skip it instead of aborting.
-                if not foreign:
-                    raise
+                except ValueError:
+                    if not foreign:
+                        raise
+                    continue  # No candidate normalizes to such a name (e.g. Finder's "Icon\r").
+                if not name.casefold().endswith(".device") or canonical(name[:-7]) not in candidates:
+                    continue
+                safe_path(directory)
+                if owned is None or directory != owned.parent or not directory.is_dir():
+                    found.append(str(directory))
+                    continue
+                found.extend(str(path) for path in directory.rglob("*") if path != owned)
     return sorted(found)
 
 

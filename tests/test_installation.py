@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import multiprocessing
+import re
 import shutil
 import tempfile
 import unittest
@@ -49,6 +50,10 @@ class InstallationTests(unittest.TestCase):
                             template=self.template)
         self.listing = patch.object(setup, "endpoints", return_value=rows()).start()
         self.addCleanup(patch.stopall)
+
+    def reset(self):
+        for path in (self.root, self.state.parent):
+            shutil.rmtree(path, ignore_errors=True)
 
     def test_roundtrip_idempotence_and_metadata(self):
         result = setup.install(**self.options)
@@ -241,6 +246,38 @@ class InstallationTests(unittest.TestCase):
                              [str(real / "Apple Inc." / "Sterownik IAC.device")])
             with self.assertRaisesRegex(ValueError, "Conflicting"):
                 setup.install(**self.options)
+
+    def test_only_a_symlinked_system_root_is_skipped(self):
+        elsewhere = self.base / "elsewhere/Sterownik IAC.device"
+        elsewhere.mkdir(parents=True)
+        real = self.base / "system-profiles"
+        for link, source in (("Apple Inc.", elsewhere.parent), ("Apple Inc./Sterownik IAC.device", elsewhere)):
+            with self.subTest(link=link):
+                self.reset()
+                shutil.rmtree(real, ignore_errors=True)
+                (real / link).parent.mkdir(parents=True, exist_ok=True)
+                (real / link).symlink_to(source, target_is_directory=True)
+                with patch.object(setup, "SYSTEM_PROFILE_ROOTS", (real,)):
+                    with self.assertRaisesRegex(ValueError, "symbolic link: " + re.escape(str(real / link))):
+                        setup.install(**self.options)
+                self.assertFalse(self.state.exists())
+                self.assertFalse(list(self.root.rglob("config.lua")))
+
+    def test_unnormalizable_system_entry_names_are_skipped_but_not_in_user_root(self):
+        real = self.base / "system-profiles"
+        maker = real / "Apple Inc."
+        maker.mkdir(parents=True)
+        (maker / "Icon\r").write_bytes(b"")
+        (maker / "...").mkdir()
+        with patch.object(setup, "SYSTEM_PROFILE_ROOTS", (real,)):
+            self.assertEqual(setup.conflicts(self.root, "Apple Inc.", "Sterownik IAC"), [])
+            (maker / "Sterownik IAC.device").mkdir()
+            self.assertEqual(setup.conflicts(self.root, "Apple Inc.", "Sterownik IAC"),
+                             [str(maker / "Sterownik IAC.device")])
+            (self.root / "Apple Inc").mkdir(parents=True)
+            (self.root / "Apple Inc/Icon\r").write_bytes(b"")
+            with self.assertRaisesRegex(ValueError, "Unsafe"):
+                setup.conflicts(self.root, "Apple Inc.", "Sterownik IAC")
 
     def test_wrong_driver_duplicate_or_different_device(self):
         for field, value in (("driver_owner", "untrusted"), ("device_unique_id", 999), ("entity", 0),
