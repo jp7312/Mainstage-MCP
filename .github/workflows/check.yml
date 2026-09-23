@@ -43,3 +43,20 @@ jobs:
       - name: Run lint
         run: make lint RUFF=.venv/bin/ruff
       # CoreMIDI loopback and MainStage round trips are separate local checks.
+
+  profile-lua:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # MainStage 4.3.1 embeds Lua 5.2; the profile also stays 5.1-compatible for older hosts.
+        lua-version: ['5.2', '5.1']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends lua${{ matrix.lua-version }}
+      - name: Check Lua version
+        run: lua${{ matrix.lua-version }} -v -e "assert(_VERSION == 'Lua ${{ matrix.lua-version }}', _VERSION)"
+      - name: Run Lua profile checks
+        run: lua${{ matrix.lua-version }} tests/check-profile.lua
