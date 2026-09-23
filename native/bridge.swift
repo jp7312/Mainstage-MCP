@@ -6,23 +6,30 @@ import Darwin
 let maximumFrame = 65536
 // Stdin lines (commands and --decode-hex) share the contract's 4096-byte command bound.
 let maximumLine = 4096
-// One legal maximum Lua snapshot (profile MAX_TOTAL 4194304) must fit the stdout backlog.
-let maximumBacklog = 4 * 1024 * 1024
+// The stdout backlog counts JSON bytes, about 2x profile.lua wire bytes at worst (\u00XX, \", \\, \/).
+// A timer batch (hello with a 1024-byte application, one replayed parameter frame, markers with 64-byte
+// ids, a MAX_TOTAL - 1024 snapshot of 4096 items) is < 8.2 MiB of JSON (--self-test builds it). The
+// profile holds MAX_PENDING = 16 refreshes (timed-out ones stay queued) and drains them 10 ms apart.
+let maximumBacklog = 16 * 9 * 1024 * 1024
 let receiveQueue = DispatchQueue(label: "mainstage.mcp.receive")
 let outputQueue = DispatchQueue(label: "mainstage.mcp.stdout")
 let outputLock = NSLock()
 var pendingOutput = 0
 func log(_ message: String) { FileHandle.standardError.write(Data((message + "\n").utf8)) }
 func fatal(_ message: String) -> Never { log(message); exit(1) }
-func json(_ object: Any) {
+func encoded(_ object: Any) -> Data {
     guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { fatal("JSON serialization failed") }
+    return data
+}
+func json(_ object: Any) {
+    let data = encoded(object)
     outputLock.lock()
     pendingOutput += data.count + 1
     let overflow = pendingOutput > maximumBacklog
     outputLock.unlock()
-    // ponytail: bounded 4 MiB stdout backlog; absorbs a legal maximum snapshot while the consumer
+    // ponytail: bounded stdout backlog; absorbs the profile's largest legal burst while the consumer
     // briefly stalls; a truly stalled consumer still loses the transport by process exit.
-    if overflow { fatal("Transport disconnected: stdout backlog exceeded 4 MiB") }
+    if overflow { fatal("Transport disconnected: stdout backlog exceeded \(maximumBacklog >> 20) MiB") }
     outputQueue.async {
         do { try FileHandle.standardOutput.write(contentsOf: data + Data([10])) }
         catch { fatal("Transport disconnected: stdout write failed") }
@@ -213,8 +220,34 @@ func selfTest() {
     precondition(parse("{\"id\":\"x\",\"command\":\"refresh\"}")?.bytes == [0xF0,0x7D] + Array("MSP2\trefresh\tx".utf8) + [0xF7])
     for text in ["", "[]", "{}", "{\"id\":\"bad id\",\"command\":\"quit\"}", "{\"id\":\"x\",\"command\":\"quit\",\"extra\":1}"] { precondition(parse(text) == nil) }
     precondition(command(Data(repeating: 32, count: 4097)) == nil)
-    // Backlog cap absorbs one legal maximum Lua snapshot before fataling on a stalled consumer.
-    precondition(maximumBacklog == 4 * 1024 * 1024 && maximumBacklog >= 4194304)
+    // Worst legal timer batch under profile.lua's limits (MAX_FRAME, MAX_TOTAL - 1024 over MAX_ITEMS,
+    // 1024-byte application, 64-byte request id; sessions assumed <= 64), measured as json() counts it.
+    // Controls and '/' double under JSON escaping. The backlog must hold MAX_PENDING (16) batches.
+    func packet(_ kind: String, _ fields: [String]) -> [UInt8] {
+        var bytes = [UInt8(0xF0), 0x7D] + Array("MSP2\t\(kind)".utf8)
+        for field in fields {
+            bytes.append(9)
+            for byte in field.utf8 {
+                if (32...126).contains(byte) && byte != 37 { bytes.append(byte) } else { bytes += Array(String(format: "%%%02X", byte).utf8) }
+            }
+        }
+        return bytes + [0xF7]
+    }
+    let session = String(repeating: "s", count: 64), request = String(repeating: "r", count: 64), revision = "9007199254740991"
+    let fill = 4194304 - 1024 - packet("selection", ["0", "0", "0", "", "", ""]).count - 4096 * packet("item", ["0", "0", "0", ""]).count
+    var snapshot = packet("selection", ["0", "0", "0", "", "", String(repeating: "/", count: fill % 4096)])
+    for _ in 0..<4096 { snapshot += packet("item", ["0", "0", "0", String(repeating: "/", count: fill / 4096)]) }
+    let parameter = [session, revision, "1", "mapped_parameter_1", "0", "0", "127", "midi_7bit"]
+    let slack = maximumFrame - packet("parameter", parameter + ["", "", "screen_control_feedback"]).count
+    let replay = packet("parameter", parameter + [String(repeating: "/", count: slack), "", "screen_control_feedback"])
+    let capabilities = "selection,patch_list,raw_midi_cc,metronome_toggle,action_metronome,action_panic,action_master_mute,action_play_stop,mapped_parameter_1"
+    let hello = packet("hello", [String(repeating: "\u{01}", count: 1024), "2", session, capabilities])
+    precondition(snapshot.count == 4194304 - 1024 && replay.count == maximumFrame && hello.count < maximumFrame)
+    var worst = SysExParser(), batch = 0, frames = 0
+    worst.feed(hello + replay + packet("snapshot_begin", [session, revision, request]) + snapshot + packet("snapshot_end", [session, revision, request, "4096"])) {
+        batch += encoded($0).count + 1; frames += 1
+    }
+    precondition(frames == 4101 && 16 * batch <= maximumBacklog)
     // --decode-hex tokens require exactly two hex digits.
     for (text, byte) in [("7d", UInt8(0x7D)), ("F0", UInt8(0xF0)), ("ab", UInt8(0xAB))] { precondition(hexByte(text) == byte) }
     for text in ["f", "7", "7dd", "0x7d", "+f", "-f", " f", "7d ", "", "zz"] { precondition(hexByte(text) == nil) }
@@ -236,7 +269,7 @@ func selfTest() {
                                       ["name": "", "display_name": "Bus", "unique_id": Int32(0)],
                                       ["name": "", "display_name": "", "unique_id": Int32(7)]]
     for info in surviving { precondition(usableRoute(info)) }
-    json(["self_test":"passed", "checks":"fragmentation, realtime, unicode, malformed input, frame bound, strict commands, correlation, snapshot backlog, hex tokens, bounded lines, list rows"])
+    json(["self_test":"passed", "checks":"fragmentation, realtime, unicode, malformed input, frame bound, strict commands, correlation, timer burst backlog, hex tokens, bounded lines, list rows"])
 }
 
 func run() {
