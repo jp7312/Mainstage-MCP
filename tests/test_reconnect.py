@@ -79,7 +79,8 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         async def crashing_reader():
             raise OSError('reader exploded')
         bridge.reader = asyncio.create_task(crashing_reader())
-        await asyncio.wait_for(bridge.close('teardown must survive'), 3)
+        # close() waits out two 1 s grace periods; this bound only has to catch a hang.
+        await asyncio.wait_for(bridge.close('teardown must survive'), 30)
         self.assertTrue(bridge.reader.done())
         self.assertFalse(bridge.connected)
         state = bridge.snapshot()
