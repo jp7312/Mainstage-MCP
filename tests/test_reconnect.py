@@ -8,6 +8,25 @@ from test_server import FAKE
 
 from mainstage_mcp.server import Bridge, ToolError
 
+SURVIVOR = 'bridge helper did not exit after SIGKILL; it may still hold the MIDI endpoints'
+
+
+class StubbornProcess:
+    """Ignores SIGTERM; exits on SIGKILL only if asked to."""
+    def __init__(self, dies_on_kill):
+        self.returncode, self.signals, self.dies_on_kill = None, [], dies_on_kill
+        self.exited = asyncio.Event()
+    def terminate(self):
+        self.signals.append('TERM')
+    def kill(self):
+        self.signals.append('KILL')
+        if self.dies_on_kill:
+            self.returncode = -9
+            self.exited.set()
+    async def wait(self):
+        await self.exited.wait()
+        return self.returncode
+
 
 class ReconnectTests(unittest.IsolatedAsyncioTestCase):
     async def test_refresh_timeout_only_invalidates_when_lock_owned(self):
@@ -63,30 +82,60 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(bridge.responsive_clock)
 
     async def test_close_tears_down_when_helper_and_reader_misbehave(self):
-        class StubProcess:
-            def __init__(self):
-                self.returncode = None
-            def terminate(self):
-                pass
-            def kill(self):
-                pass
-            async def wait(self):
-                await asyncio.Future()
-
-        bridge = Bridge(['unused'])
-        bridge.process = StubProcess()
-        bridge.connected = True
         async def crashing_reader():
             raise OSError('reader exploded')
-        bridge.reader = asyncio.create_task(crashing_reader())
-        # close() waits out two 1 s grace periods; this bound only has to catch a hang.
-        await asyncio.wait_for(bridge.close('teardown must survive'), 30)
-        self.assertTrue(bridge.reader.done())
-        self.assertFalse(bridge.connected)
-        state = bridge.snapshot()
-        self.assertTrue(state.stale)
-        self.assertFalse(state.transport_connected)
-        self.assertEqual(state.reason, 'teardown must survive')
+        for dies_on_kill in (True, False):
+            with self.subTest(dies_on_kill=dies_on_kill):
+                bridge = Bridge(['unused'])
+                bridge.process = process = StubbornProcess(dies_on_kill)
+                bridge.connected = True
+                bridge.reader = asyncio.create_task(crashing_reader())
+                # close() waits out two 1 s grace periods; this bound only has to catch a hang.
+                closing = asyncio.wait_for(bridge.close('teardown must survive'), 30)
+                if dies_on_kill:
+                    await closing
+                else:
+                    with self.assertRaisesRegex(ToolError, f'^{SURVIVOR}$'):
+                        await closing
+                self.assertEqual(process.signals, ['TERM', 'KILL'])
+                self.assertTrue(bridge.reader.done())
+                self.assertFalse(bridge.connected)
+                state = bridge.snapshot()
+                self.assertTrue(state.stale)
+                self.assertFalse(state.transport_connected)
+                self.assertEqual(state.bridge_running, not dies_on_kill)
+                self.assertEqual(state.reason, 'teardown must survive' if dies_on_kill else SURVIVOR)
+
+    async def test_reconnect_never_spawns_while_the_old_helper_survives_sigkill(self):
+        bridge = Bridge(['unused'], .5)
+        bridge.process = process = StubbornProcess(dies_on_kill=False)
+        bridge.connected = True
+        bridge.reader = asyncio.create_task(asyncio.Event().wait())
+        with patch.object(bridge, 'start', side_effect=AssertionError(
+                'spawned a second helper while the old one may hold the endpoints')) as start:
+            for attempt in range(2):
+                with self.assertRaisesRegex(ToolError, f'^{SURVIVOR}$'):
+                    await asyncio.wait_for(bridge.reconnect(), 30)
+                start.assert_not_called()
+                self.assertEqual(process.signals, ['TERM', 'KILL'] * (attempt + 1))
+                self.assertIs(bridge.process, process)
+                state = bridge.snapshot()
+                self.assertTrue(state.bridge_running)
+                self.assertFalse(state.transport_connected)
+                self.assertTrue(state.stale)
+                self.assertEqual(state.reason, SURVIVOR)
+
+            # A cancelled reconnect stays cancelled; the survivor remains visible in state.
+            task = asyncio.create_task(bridge.reconnect())
+            async with asyncio.timeout(10):
+                while not process.signals[4:]:
+                    await asyncio.sleep(.01)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 30)
+            start.assert_not_called()
+            self.assertEqual(process.signals, ['TERM', 'KILL'] * 2 + ['TERM', 'TERM', 'KILL'])
+            self.assertEqual(bridge.snapshot().reason, SURVIVOR)
 
     async def test_cancellation_closes_helper_and_preserves_stale_snapshot(self):
         helpers = {

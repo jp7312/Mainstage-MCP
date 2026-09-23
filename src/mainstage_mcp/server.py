@@ -551,7 +551,8 @@ class Bridge:
                     await self.send('refresh')
                     return self.snapshot()
             except asyncio.CancelledError:
-                await self.close('explicit reconnect cancelled')
+                with suppress(ToolError):  # A surviving helper stays visible in state.
+                    await self.close('explicit reconnect cancelled')
                 raise
             except (TimeoutError, OSError, ValueError) as error:
                 reason = str(error) or 'reconnect timed out'
@@ -572,12 +573,17 @@ class Bridge:
                         self.process.kill()
                     with suppress(TimeoutError):
                         await asyncio.wait_for(self.process.wait(), 1)
+            survived = self.process.returncode is None
+            if survived:
+                reason = 'bridge helper did not exit after SIGKILL; it may still hold the MIDI endpoints'
             if self.reader:
                 self.reader.cancel()
                 await asyncio.gather(self.reader, return_exceptions=True)
         finally:
             self.connected = False
             self.invalidate(reason)
+        if survived:  # Never report closed, or let reconnect() spawn, while the old helper may hold the endpoints.
+            raise ToolError(reason)
 
 
 def create_server(bridge: Bridge) -> MCPServer:
