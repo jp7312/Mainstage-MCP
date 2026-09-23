@@ -32,14 +32,14 @@ if EXPERIMENTAL_PARAMETER then
 end
 
 -- Percent-encode bytes outside printable ASCII plus '%' itself; table lookups avoid
--- paying string.format per byte.
+-- paying string.format per byte. The class is negated because Lua 5.1 patterns end at NUL.
 local encodings = {}
 for byte = 0, 255 do
     encodings[string.char(byte)] = (byte < 32 or byte > 126 or byte == 37)
         and string.format('%%%02X', byte) or string.char(byte)
 end
 local function escape(value)
-    return (tostring(value):gsub('[\0-\31\127-\255%%]', encodings))
+    return (tostring(value):gsub('[^ -$&-~]', encodings))
 end
 
 local function packet(kind, fields)
@@ -71,19 +71,24 @@ local function integer(value, low, high)
     return type(value) == 'number' and value == math.floor(value) and value >= low and value <= high
 end
 local function index(value) return integer(value, -1, 2147483647) end
--- Longest-first strip of every well-formed sequence; anything with bytes >= 128 left
--- is malformed (overlong, surrogate, > U+10FFFF, truncated or lone continuations).
-local utf8Sequences = {
-    '\240[\144-\191][\128-\191][\128-\191]',
-    '\244[\128-\143][\128-\191][\128-\191]',
-    '[\241-\243][\128-\191][\128-\191][\128-\191]',
-    '\224[\160-\191][\128-\191]',
-    '\237[\128-\159][\128-\191]',
-    '[\225-\236\238-\239][\128-\191][\128-\191]',
-    '[\194-\223][\128-\191]'}
+-- Well-formed UTF-8 (RFC 3629) left to right: each lead byte selects an anchored pattern for
+-- its trail bytes (no overlongs, surrogates or > U+10FFFF) plus the ASCII run after it.
+-- Other leads (lone continuations, C0, C1, F5-FF) and truncated sequences fail.
+local utf8Trails = {}
+for byte = 0xC2, 0xF4 do
+    local second = byte == 0xE0 and '[\160-\191]' or byte == 0xED and '[\128-\159]'
+        or byte == 0xF0 and '[\144-\191]' or byte == 0xF4 and '[\128-\143]' or '[\128-\191]'
+    utf8Trails[byte] = '^' .. second .. string.rep('[\128-\191]', byte < 0xE0 and 0 or byte < 0xF0 and 1 or 2)
+        .. '[^\128-\255]*()'
+end
 local function utf8(value)
-    for i = 1, #utf8Sequences do value = (value:gsub(utf8Sequences[i], '')) end
-    return not value:find('[\128-\255]')
+    local i = value:find('[\128-\255]')
+    while i and i <= #value do
+        local trail = utf8Trails[value:byte(i)]
+        i = trail and value:match(trail, i + 1)
+        if not i then return false end
+    end
+    return true
 end
 local function text(value) return type(value) == 'string' and #value <= MAX_FRAME end
 -- Dedup key tags raw values by type and length, so distinct field tuples cannot collide
@@ -127,7 +132,10 @@ end
 
 function controller_select_patch(program, patch, set, concert, list, setIndex, patchIndex)
     if not session then return output() end
-    if type(list) ~= 'table' then return reject('invalid_snapshot', 'Invalid selection fields') end
+    if not integer(program, -1, 127) or not index(setIndex) or not index(patchIndex)
+        or not text(patch) or not text(set) or not text(concert) or type(list) ~= 'table' then
+        return reject('invalid_snapshot', 'Invalid selection fields')
+    end
     local count, tags = 0, {tag(program), tag(setIndex), tag(patchIndex),
         tag(concert), tag(set), tag(patch)}
     for key in pairs(list) do
@@ -149,9 +157,7 @@ function controller_select_patch(program, patch, set, concert, list, setIndex, p
     end
     local key = table.concat(tags)
     if key == snapshotKey and not snapshotError then return output() end
-    if not integer(program, -1, 127) or not index(setIndex) or not index(patchIndex)
-        or not text(patch) or not text(set) or not text(concert)
-        or not utf8(patch) or not utf8(set) or not utf8(concert) then
+    if not utf8(patch) or not utf8(set) or not utf8(concert) then
         return reject('invalid_snapshot', 'Invalid selection fields')
     end
     local events, total = {}, 0
