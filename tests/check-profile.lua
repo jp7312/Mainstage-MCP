@@ -1,4 +1,19 @@
--- Run from package root: lua tests/check-profile.lua
+-- Run from package root: lua tests/check-profile.lua (Lua 5.1 or later)
+-- Lua 5.1 reads patterns as NUL-terminated C strings, so a NUL byte breaks the pattern there
+-- while newer Luas accept it; reject any such pattern up front, method calls included.
+local plainFind = string.find
+for _, name in ipairs({'find', 'match', 'gmatch', 'gsub'}) do
+    local original = string[name]
+    string[name] = function(value, pattern, ...)
+        if type(pattern) == 'string' and plainFind(pattern, '\0', 1, true) then
+            error('NUL byte in string.' .. name .. ' pattern breaks Lua 5.1', 2)
+        end
+        return original(value, pattern, ...)
+    end
+end
+local guarded, guardError = pcall(function() return ('x'):gsub('[\0-\1]', '') end)
+assert(not guarded and guardError:find('NUL byte', 1, true))
+local load = loadstring or load -- Lua 5.1 load() takes a reader function, not a string.
 local f = assert(io.open('src/mainstage_mcp/profile.lua', 'rb'))
 local source = f:read('*a'); f:close()
 local replacements = {__MS_INPUT__ = 'Test Input', __MS_OUTPUT__ = 'Test Output',
@@ -9,7 +24,8 @@ source = source:gsub('__MS_EXPERIMENTAL_PARAMETER__', 'true')
 local timers = 0
 settriggertimer = function(ms) assert(ms == 10); timers = timers + 1 end
 MIDI_LSB = 999 -- Host-supplied placeholder for the variable value byte.
-assert(load(source, 'profile'))()
+-- Returning the chunk's locals exposes the validator and encoder without a production hook.
+local profileUtf8, profileEscape = assert(load(source .. '\nreturn utf8, escape', 'profile'))()
 local function decode(event)
     assert(event[1] == 240 and event[2] == 125 and event[#event] == 247)
     local chars = {}
@@ -90,6 +106,7 @@ local function rejected(items, patch)
     local recovered = select()
     assert(#recovered == 6 and decode(recovered[1])[2] == 'snapshot_begin')
     assert(decode(refresh('recovered')[2])[2] == 'snapshot_begin')
+    return decode(result[1])[4]
 end
 rejected({[2] = list[1]})
 rejected({{IsPatch = 'yes', SetIndex = 0, PatchIndex = 0, Label = 'bad'}})
@@ -97,7 +114,29 @@ rejected(list, string.rep('%', 23000))
 local huge = {}; for i = 1, 4097 do huge[i] = list[1] end; rejected(huge)
 local big = {}; for i = 1, 4096 do big[i] = {IsPatch = true, SetIndex = 0, PatchIndex = i, Label = string.rep('x', 1100)} end
 rejected(big)
+-- Swift drops frames whose percent-decoded bytes are not valid UTF-8, so the profile
+-- must reject such snapshots instead of committing frames the bridge would swallow.
+assert(rejected(list, string.char(0xC3, 0x28) .. 'Latin-1 Patch') == 'invalid_snapshot')
+assert(rejected({{IsPatch = true, SetIndex = 0, PatchIndex = 0,
+    Label = string.char(0xED, 0xA0, 0x80)}}) == 'invalid_snapshot') -- surrogate D800
+-- Stitching: dropping the middle sequence would join the outer bytes into a valid one.
+local stitched = {string.char(0xD0, 0xF1, 0x97, 0x80, 0x9F, 0x84), string.char(0xD2, 0xEC, 0xB0, 0xA3, 0x84)}
+for _, bad in ipairs(stitched) do
+    assert(rejected(list, bad) == 'invalid_snapshot')
+    assert(rejected({{IsPatch = true, SetIndex = 0, PatchIndex = 0, Label = bad}}) == 'invalid_snapshot')
+end
+assert(decode(refresh('utf8_survivor')[3])[8] == 'Żółć 🎹\t%\n') -- last good snapshot survives
+assert(#select() == 0)
+-- Frame boundary: 65533 payload bytes make exactly a 65536-byte frame; one more fails.
+local maxPatch = string.rep('x', 65500)
+local maxed = controller_select_patch(0, maxPatch, 'Set', 'Concert',
+    {{IsPatch = true, SetIndex = 0, PatchIndex = 0, Label = 'Only'}}, 0, 0).midi
+assert(#maxed[2] == 65536 and decode(maxed[2])[8] == maxPatch)
+assert(#refresh('max_frame')[3] == 65536)
+assert(rejected(list, string.rep('x', 65501)) == 'snapshot_limit')
 assert(controller_midi_out({[0] = 0xBF, [1] = 91, [2] = 64}, 'Other', '64', nil) == nil)
+assert(#controller_midi_out({[0] = 0xBF, [1] = 90, [2] = 90}, stitched[1], '1.2 kHz', nil).midi == 0)
+assert(#controller_midi_out({[0] = 0xBF, [1] = 90, [2] = 90}, 'Cutoff', stitched[2], nil).midi == 0)
 local callback = controller_midi_out({[0] = 0xBF, [1] = 90, [2] = 90}, 'Cutoff', '1.2 kHz', nil)
 local value = decode(callback.midi)
 assert(callback.outport == 'Test Output' and value[2] == 'parameter')
@@ -116,7 +155,101 @@ assert(#controller_timer_trigger().midi == 0)
 local nextSession = decode(controller_initialize('MainStage', false).midi[1])[5]
 assert(session ~= nextSession)
 assert(decode(refresh('new_session')[2])[4] == 'no_snapshot')
-print('profile checks passed: zero, Unicode, duplicates, revisions, correlation, sessions, pass-through, malformed input, bounds')
+assert(decode(controller_initialize(stitched[1], false).midi[1])[3] == '')
+print('profile checks passed: zero, Unicode, duplicates, revisions, correlation, sessions, pass-through, malformed input, bounds, utf8 rejection, frame boundary')
+
+for byte = 0, 255 do
+    local char = string.char(byte)
+    local expected = (byte < 32 or byte > 126 or char == '%') and string.format('%%%02X', byte) or char
+    assert(profileEscape(char) == expected and profileEscape('a' .. char .. 'b') == 'a' .. expected .. 'b')
+end
+-- utf8() must agree with a decoder written straight from Unicode Table 3-7 (and with strict
+-- utf8.len where it exists) on exhaustive short strings, boundary bytes and seeded stitching.
+local table37 = {{{0x00, 0x7F}}, {{0xC2, 0xDF}, {0x80, 0xBF}},
+    {{0xE0, 0xE0}, {0xA0, 0xBF}, {0x80, 0xBF}}, {{0xE1, 0xEC}, {0x80, 0xBF}, {0x80, 0xBF}},
+    {{0xED, 0xED}, {0x80, 0x9F}, {0x80, 0xBF}}, {{0xEE, 0xEF}, {0x80, 0xBF}, {0x80, 0xBF}},
+    {{0xF0, 0xF0}, {0x90, 0xBF}, {0x80, 0xBF}, {0x80, 0xBF}},
+    {{0xF1, 0xF3}, {0x80, 0xBF}, {0x80, 0xBF}, {0x80, 0xBF}},
+    {{0xF4, 0xF4}, {0x80, 0x8F}, {0x80, 0xBF}, {0x80, 0xBF}}}
+local function wellFormed(s)
+    local i = 1
+    while i <= #s do
+        local row
+        for _, r in ipairs(table37) do if s:byte(i) >= r[1][1] and s:byte(i) <= r[1][2] then row = r end end
+        if not row then return false end
+        for k = 2, #row do
+            local byte = s:byte(i + k - 1)
+            if not byte or byte < row[k][1] or byte > row[k][2] then return false end
+        end
+        i = i + #row
+    end
+    return true
+end
+-- Only Lua 5.4+ strict mode rejects surrogates, > U+10FFFF and 5-byte forms; 5.3 accepts some.
+local strictLen = utf8 and utf8.len
+for _, bad in ipairs({'\237\160\128', '\244\144\128\128', '\248\136\128\128\128'}) do
+    if strictLen and strictLen(bad, 1, -1, false) then strictLen = nil end
+end
+local fuzzed, accepted = 0, 0
+local function agree(s)
+    local expected = wellFormed(s)
+    if profileUtf8(s) ~= expected or strictLen and (strictLen(s, 1, -1, false) ~= nil) ~= expected then
+        error('utf8 mismatch on ' .. s:gsub('.', function(c) return string.format('%02X ', c:byte()) end))
+    end
+    fuzzed, accepted = fuzzed + 1, accepted + (expected and 1 or 0)
+    return expected
+end
+for a = 0, 255 do
+    agree(string.char(a))
+    for b = 0, 255 do agree(string.char(a, b)) end
+end
+assert(fuzzed == 256 + 65536 and accepted == 128 + 128 * 128 + 30 * 64) -- ASCII, ASCII pairs, C2-DF 80-BF
+-- Both sides of every Table 3-7 range edge, in every position of 3- and 4-byte strings.
+local edges = {0x00, 0x41, 0x7F, 0x80, 0x8F, 0x90, 0x9F, 0xA0, 0xBF, 0xC0, 0xC1, 0xC2, 0xDF, 0xE0,
+    0xE1, 0xEC, 0xED, 0xEE, 0xEF, 0xF0, 0xF1, 0xF3, 0xF4, 0xF5, 0xF7, 0xF8, 0xFF}
+for a = 0, 255 do for _, b in ipairs(edges) do for _, c in ipairs(edges) do agree(string.char(a, b, c)) end end end
+for _, a in ipairs(edges) do for _, b in ipairs(edges) do for _, c in ipairs(edges) do for _, d in ipairs(edges) do
+    agree(string.char(a, b, c, d))
+end end end end
+local seed = 20260923 -- Park-Miller, so every Lua version fuzzes the same strings.
+local function random(n) seed = seed * 16807 % 2147483647; return seed % n + 1 end
+-- Lone continuations and bad leads, overlongs, surrogates and sequences above U+10FFFF.
+local invalidRows = {{{0x80, 0xC1}}, {{0xF5, 0xFF}}, {{0xC0, 0xC1}, {0x80, 0xBF}},
+    {{0xE0, 0xE0}, {0x80, 0x9F}, {0x80, 0xBF}}, {{0xED, 0xED}, {0xA0, 0xBF}, {0x80, 0xBF}},
+    {{0xF0, 0xF0}, {0x80, 0x8F}, {0x80, 0xBF}, {0x80, 0xBF}}, {{0xF4, 0xF4}, {0x90, 0xBF}, {0x80, 0xBF}, {0x80, 0xBF}},
+    {{0xF5, 0xF7}, {0x80, 0xBF}, {0x80, 0xBF}, {0x80, 0xBF}}}
+local function sequence(row, first, last)
+    local chars = {}
+    for k = first or 1, last or #row do
+        chars[#chars + 1] = string.char(row[k][1] + random(row[k][2] - row[k][1] + 1) - 1)
+    end
+    return table.concat(chars)
+end
+local function multibyte() return sequence(table37[random(8) + 1]) end
+-- A split sequence around valid multibyte text: stripping the middle would make it well formed.
+local function stitch()
+    local row = table37[random(8) + 1]
+    local cut, middle = random(#row - 1), {}
+    for k = 1, random(3) do middle[k] = multibyte() end
+    return sequence(row, 1, cut) .. table.concat(middle) .. sequence(row, cut + 1)
+end
+local fragments = {multibyte, stitch, function() return sequence(table37[1]) end,
+    function() return sequence(invalidRows[random(#invalidRows)]) end,
+    function() local row = table37[random(8) + 1]; return sequence(row, 1, random(#row - 1)) end}
+for _ = 1, 20000 do
+    local before, after = {}, {}
+    for k = 1, random(3) - 1 do before[k] = random(2) == 1 and multibyte() or sequence(table37[1]) end
+    for k = 1, random(3) - 1 do after[k] = random(2) == 1 and multibyte() or sequence(table37[1]) end
+    assert(not agree(table.concat(before) .. stitch() .. table.concat(after)))
+end
+for _ = 1, 40000 do
+    local parts = {}
+    for k = 1, random(6) do parts[k] = fragments[random(#fragments)]() end
+    agree(table.concat(parts))
+end
+for _, bad in ipairs(stitched) do assert(not agree(bad)) end
+print(string.format('utf8 fuzz passed: %d strings (%d well formed) agree with Table 3-7%s; '
+    .. 'escape matches all 256 bytes', fuzzed, accepted, strictLen and ' and strict utf8.len' or ''))
 
 f = assert(io.open('src/mainstage_mcp/profile.lua', 'rb'))
 local experimentalSource = f:read('*a'); f:close()
