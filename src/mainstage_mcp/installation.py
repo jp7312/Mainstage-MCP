@@ -20,6 +20,8 @@ SYSTEM_PROFILE_ROOTS = (Path("/Library/Audio/MIDI Device Profiles"),
 # Object handles can change between processes; persistent MIDI IDs cannot.
 ENDPOINT_KEYS = ("direction", "name", "unique_id", "entity_unique_id", "device_unique_id", "device_name",
                  "manufacturer", "model", "driver_owner")
+# Exactly the names tempfile.mkstemp gives write_exclusive's temporary files.
+TEMPORARY = re.compile(r"\.mainstage-mcp-[a-z0-9_]{8}")
 
 
 def safe_path(value):
@@ -62,6 +64,11 @@ def write_exclusive(path, data):
         os.unlink(temporary)
 
 
+def temporaries(directory):
+    return [path for path in directory.iterdir()
+            if TEMPORARY.fullmatch(path.name) and not path.is_symlink() and path.is_file()]
+
+
 def endpoints(bridge):
     result = subprocess.run([str(bridge), "--list"], capture_output=True, text=True, timeout=15, check=True)
     rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
@@ -71,7 +78,8 @@ def endpoints(bridge):
 
 
 def identity(rows):
-    # Object handles can change between processes; persistent MIDI IDs cannot.
+    # Object handles can change between processes; persistent MIDI IDs cannot. Keys a row lacks compare as None,
+    # so recorded rows stay comparable when ENDPOINT_KEYS grows, and unknown keys are ignored.
     return sorted([{key: row.get(key) for key in ENDPOINT_KEYS} for row in rows],
                   key=lambda row: json.dumps(row, sort_keys=True))
 
@@ -136,27 +144,29 @@ def read_manifest(state, root):
     state, root = safe_path(state), safe_path(root)
     if not state.exists():
         return None
+    remedy = f"; remove {state.name} and the profile it describes, then reinstall"
     try:
-        value = json.loads(state.read_text())
-    except json.JSONDecodeError as error:
-        raise ValueError(f"Corrupt installation manifest {state.name} ({error}); remove {state.name}"
-                         " and the profile it describes, then reinstall") from error
+        value = json.loads(state.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Corrupt installation manifest {state.name} ({error})" + remedy) from error
     if not isinstance(value, dict):
-        raise ValueError(f"Corrupt installation manifest {state.name}; remove {state.name}"
-                         " and the profile it describes, then reinstall")
+        raise ValueError(f"Corrupt installation manifest {state.name}" + remedy)
+    # Every manifest this installer wrote has these fields; one without them proves no ownership.
     for field in ("profile_root", "file", "input", "output"):
         if not isinstance(value.get(field), str) or not value[field].strip():
-            raise ValueError(f"Installation manifest field {field!r} must be a nonempty string")
+            raise ValueError(f"Installation manifest field {field!r} must be a nonempty string" + remedy)
     if type(value.get("version")) is not int:
-        raise ValueError("Installation manifest field 'version' must be an integer")
-    if (not isinstance(value.get("endpoints"), list)
-            or any(not isinstance(row, dict) or not set(ENDPOINT_KEYS) <= row.keys() for row in value["endpoints"])):
-        raise ValueError("Installation manifest field 'endpoints' must be a list of endpoint objects with keys "
-                         + ", ".join(ENDPOINT_KEYS))
+        raise ValueError("Installation manifest field 'version' must be an integer" + remedy)
+    if not isinstance(value.get("endpoints"), list) or any(not isinstance(row, dict) for row in value["endpoints"]):
+        raise ValueError("Installation manifest field 'endpoints' must be a list of endpoint objects" + remedy)
     if not isinstance(value.get("sha256"), str) or not re.fullmatch("[0-9a-f]{64}", value["sha256"]):
-        raise ValueError("Installation manifest field 'sha256' must be 64 lowercase hex characters")
-    if value["version"] != 1 or value["profile_root"] != str(root):
-        raise ValueError("Installation manifest version/root mismatch")
+        raise ValueError("Installation manifest field 'sha256' must be 64 lowercase hex characters" + remedy)
+    if value["version"] != 1:
+        raise ValueError(f"Installation manifest {state.name} has version {value['version']};"
+                         " use the mainstage-mcp release that wrote it")
+    if value["profile_root"] != str(root):
+        raise ValueError(f"Installation manifest {state.name} is for profile root {value['profile_root']};"
+                         " pass that path as --profile-root")
     target = safe_path(value["file"])
     if target.parent.parent.parent != root or target.name != "config.lua" or not target.parent.name.endswith(".device"):
         raise ValueError("Manifest points outside its owned profile")
@@ -184,31 +194,64 @@ def locked(state):
 def conflicts(root, manufacturer, model, owned=None, device_names=()):
     found = []
     candidates = {canonical(name) for name in (model, *device_names)}
-    for foreign, base in ((False, safe_path(root)), *((True, path) for path in SYSTEM_PROFILE_ROOTS)):
+    bases = [(False, safe_path(root))]
+    for base in SYSTEM_PROFILE_ROOTS:
+        try:
+            bases.append((True, safe_path(base)))
+        except ValueError:
+            pass  # A symlinked system root is foreign territory we cannot inspect; skip it instead of aborting.
+    for foreign, base in bases:
         if not base.exists():
             continue
         for maker in base.iterdir():
             if canonical(maker.name) != canonical(manufacturer):
                 continue
-            try:
-                safe_path(maker)
-                if not maker.is_dir():
-                    found.append(str(maker))
-                    continue
-                for directory in maker.iterdir():
+            safe_path(maker)
+            if not maker.is_dir():
+                found.append(str(maker))
+                continue
+            for directory in maker.iterdir():
+                try:
                     name = normalized_component(directory.name)
-                    if not name.casefold().endswith(".device") or canonical(name[:-7]) not in candidates:
-                        continue
-                    safe_path(directory)
-                    if owned is None or directory != owned.parent or not directory.is_dir():
-                        found.append(str(directory))
-                        continue
-                    found.extend(str(path) for path in directory.rglob("*") if path != owned)
-            except ValueError:
-                # A symlinked system root is foreign territory we cannot inspect; skip it instead of aborting.
-                if not foreign:
-                    raise
+                except ValueError:
+                    if not foreign:
+                        raise
+                    continue  # No candidate normalizes to such a name (e.g. Finder's "Icon\r").
+                if not name.casefold().endswith(".device") or canonical(name[:-7]) not in candidates:
+                    continue
+                safe_path(directory)
+                if owned is None or directory != owned.parent or not directory.is_dir():
+                    found.append(str(directory))
+                    continue
+                found.extend(str(path) for path in directory.rglob("*") if path != owned)
     return sorted(found)
+
+
+def pending(state):
+    """Install journals its manifest here before touching the profile root, proving what an interrupted run made."""
+    journal = safe_path(str(state) + ".pending")
+    if journal.exists() and state.exists():
+        journal.unlink()  # The manifest was published; its journal is spent.
+    return journal
+
+
+def remove(record, root):
+    """Delete a recorded profile, our temporary files beside it and the record; keep and return a changed file."""
+    manifest = read_manifest(record, root)
+    target = safe_path(manifest["file"])
+    if target.exists() and (not target.is_file() or digest(target.read_bytes()) != manifest["sha256"]):
+        return str(target)
+    if target.parent.is_dir():
+        for path in temporaries(target.parent):
+            path.unlink()
+    if target.exists():
+        target.unlink()
+    for directory in (target.parent, target.parent.parent):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    record.unlink()
 
 
 def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output", profile_root=PROFILE_ROOT,
@@ -218,6 +261,12 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
         before = endpoints(bridge)
         manufacturer, model = select_device(before, input_name, output_name)
         target = safe_path(root / manufacturer / (model + ".device") / "config.lua")
+        journal = pending(state)
+        if journal.exists():
+            preserved = remove(journal, root)
+            if preserved:
+                raise ValueError(f"Interrupted installation left changed file {preserved};"
+                                 " inspect it and remove it if unneeded, then reinstall")
         old = read_manifest(state, root)
         if old and (old["file"] != str(target) or old["input"] != input_name or old["output"] != output_name
                     or bool(old.get("experimental_actions")) != experimental_actions
@@ -229,17 +278,22 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
             template = template or files("mainstage_mcp").joinpath("profile.lua")
             data = render(template, input_name, output_name, manufacturer, model,
                           experimental_actions, experimental_mapped_parameter)
-            # A crash between publishing config.lua and the manifest leaves our own bytes behind; adopt them.
+            # Versions before the journal could crash between publishing config.lua and the manifest,
+            # leaving our own bytes behind; adopt them.
             orphan = target.is_file() and target.read_bytes() == data
             if target.exists() and not orphan:
                 raise ValueError("Conflicting profile file: " + str(target))
         conflicting = conflicts(root, manufacturer, model, target if (old or orphan) else None, device_names)
         if conflicting:
-            raise ValueError("Conflicting profile files: " + ", ".join(conflicting))
+            hint = ""
+            if not old and target.parent.is_dir() and set(target.parent.iterdir()) <= set(temporaries(target.parent)):
+                hint = (f"; {target.parent.name} holds no profile, only what an interrupted install leaves behind:"
+                        " remove it if you did not create it, then reinstall")
+            raise ValueError("Conflicting profile files: " + ", ".join(conflicting) + hint)
         if old:
             if not target.is_file() or digest(target.read_bytes()) != old["sha256"]:
                 raise ValueError("Owned profile was changed or removed; refusing overwrite")
-            if identity(before) != old["endpoints"]:
+            if identity(before) != identity(old["endpoints"]):
                 raise ValueError("MIDI endpoint identity changed since installation")
             return {"installed": True, "changed": False, "file": str(target),
                     "experimental_actions": experimental_actions,
@@ -249,31 +303,31 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
                     "experimental_actions": experimental_actions,
                     "experimental_mapped_parameter": experimental_mapped_parameter,
                     "endpoints": identity(before), "bridge": str(Path(bridge).expanduser().resolve())}
-        created = False
-        state_created = False
+        encoded = (json.dumps(manifest, indent=2) + "\n").encode()
+        journaled = made = state_created = False
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
             if not orphan:
+                write_exclusive(journal, encoded)
+                journaled = True
+                target.parent.mkdir(parents=True)
+                made = True
                 write_exclusive(target, data)
-                created = True
             if identity(endpoints(bridge)) != identity(before):
                 raise ValueError("MIDI identities changed during installation; profile rolled back")
-            write_exclusive(state, (json.dumps(manifest, indent=2) + "\n").encode())
+            if not target.is_file() or digest(target.read_bytes()) != manifest["sha256"]:
+                raise ValueError("Profile changed during installation; refusing to record it")
+            write_exclusive(state, encoded)
             state_created = True
         except BaseException:
             if state_created:
                 state.unlink()
-            if created and target.is_file() and digest(target.read_bytes()) == digest(data):
-                target.unlink()
-                try:
-                    target.parent.rmdir()
-                except OSError:
-                    pass
-            try:
-                target.parent.parent.rmdir()
-            except OSError:
-                pass
+            if made:
+                remove(journal, root)
+            elif journaled:
+                journal.unlink()
             raise
+        if journaled:
+            journal.unlink()
         return {"installed": True, "changed": True, "file": str(target),
                 "experimental_actions": experimental_actions,
                 "experimental_mapped_parameter": experimental_mapped_parameter,
@@ -283,20 +337,14 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
 def uninstall(state=STATE, profile_root=PROFILE_ROOT):
     state, root = safe_path(state), safe_path(profile_root)
     with locked(state):
-        manifest = read_manifest(state, root)
-        if not manifest:
+        # Without a manifest, an interrupted install's journal is the record to roll back.
+        journal = pending(state)
+        record = state if state.exists() else journal
+        if not record.exists():
             return {"uninstalled": True, "changed": False}
-        target = safe_path(manifest["file"])
-        if target.exists():
-            if not target.is_file() or digest(target.read_bytes()) != manifest["sha256"]:
-                return {"uninstalled": False, "preserved_changed_file": str(target)}
-            target.unlink()
-        state.unlink()
-        for directory in (target.parent, target.parent.parent):
-            try:
-                directory.rmdir()
-            except OSError:
-                pass
+        preserved = remove(record, root)
+        if preserved:
+            return {"uninstalled": False, "preserved_changed_file": preserved}
         return {"uninstalled": True, "changed": True}
 
 
@@ -312,13 +360,16 @@ def doctor(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output",
         manifest = read_manifest(state, profile_root)
         if not manifest:
             result["issues"].append("Profile is not installed by this installer")
+            if safe_path(str(state) + ".pending").exists():
+                result["issues"].append("An installation was interrupted before it was recorded;"
+                                        " run uninstall to roll back what it made")
         else:
             target = safe_path(manifest["file"])
             if not target.is_file() or digest(target.read_bytes()) != manifest["sha256"]:
                 result["issues"].append("Owned profile is missing or modified")
             if (manifest["input"], manifest["output"]) != (input_name, output_name):
                 result["issues"].append("Requested buses differ from installed profile")
-            if identity(rows) != manifest["endpoints"]:
+            if identity(rows) != identity(manifest["endpoints"]):
                 result["issues"].append("MIDI endpoint identities changed since installation")
         device_names = {row["device_name"] for row in rows if row.get("name") in (input_name, output_name)}
         owned = Path(manifest["file"]) if manifest else None
