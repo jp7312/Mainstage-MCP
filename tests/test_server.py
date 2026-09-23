@@ -571,20 +571,20 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(b.counter, 1, 'Schema-invalid session strings never reach the native bridge')
 
     def test_main_rejects_blank_or_unsafe_endpoint_names(self):
-        for argv in (['--bridge', 'helper', '--input', ''],
-                     ['--bridge', 'helper', '--input', '   '],
-                     ['--bridge', 'helper', '--input', 'In\nPut'],
-                     ['--bridge', 'helper', '--input', 'In\x00Put'],
-                     ['--bridge', 'helper', '--output', ''],
-                     ['--bridge', 'helper', '--output', '\t'],
-                     ['--bridge', 'helper', '--output', 'Out\x00Put'],
+        unsafe = ['', '   ', '\t', *(f'In{chr(code)}Put' for code in range(32))]
+        for argv in (*(['--bridge', 'helper', flag, name] for flag in ('--input', '--output') for name in unsafe),
                      ['--bridge', 'helper', '--input', 'ok', '--output', '']):
-            with redirect_stderr(io.StringIO()):
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
                 with patch('mainstage_mcp.server.create_server',
                            side_effect=AssertionError('endpoint validation must run first')):
                     with self.assertRaises(SystemExit) as exited:
                         main(argv)
-            self.assertEqual(exited.exception.code, 2)
+                self.assertEqual(exited.exception.code, 2)
+        # Endpoint names are not path components: slashes and dots stay valid.
+        with patch('mainstage_mcp.server.create_server') as create:
+            main(['--bridge', 'helper', '--input', 'Bus 1/2 · Żółć', '--output', '..\\Out.'])
+        self.assertEqual(create.call_args.args[0].command,
+                         ['helper', '--iac-input', 'Bus 1/2 · Żółć', '--iac-output', '..\\Out.'])
 
     async def test_real_stdio_sdk(self):
         with tempfile.TemporaryDirectory() as directory:
