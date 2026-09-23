@@ -271,7 +271,13 @@ class Bridge:
                 self.transaction = dict(ignored=True)
                 return
             if self.transaction and not self.transaction.get('ignored'):
-                raise ValueError('overlapping snapshot')
+                # Neither batch may commit: fail their waiters now and consume the rest of this batch.
+                for waiter in (self.responses.get(self.transaction['request']), future):
+                    if waiter and not waiter.done():
+                        waiter.set_result({'error': 'overlapping snapshot'})
+                self.invalidate('overlapping snapshot')
+                self.transaction = dict(ignored=True)
+                return
             self.invalidate('snapshot incomplete')
             if fields[0] != self.session or not self.profile_seen:
                 raise ValueError('snapshot session mismatch')
