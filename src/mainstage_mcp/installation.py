@@ -71,7 +71,8 @@ def endpoints(bridge):
 
 
 def identity(rows):
-    # Object handles can change between processes; persistent MIDI IDs cannot.
+    # Object handles can change between processes; persistent MIDI IDs cannot. Keys a row lacks compare as None,
+    # so recorded rows stay comparable when ENDPOINT_KEYS grows, and unknown keys are ignored.
     return sorted([{key: row.get(key) for key in ENDPOINT_KEYS} for row in rows],
                   key=lambda row: json.dumps(row, sort_keys=True))
 
@@ -136,27 +137,29 @@ def read_manifest(state, root):
     state, root = safe_path(state), safe_path(root)
     if not state.exists():
         return None
+    remedy = f"; remove {state.name} and the profile it describes, then reinstall"
     try:
-        value = json.loads(state.read_text())
-    except json.JSONDecodeError as error:
-        raise ValueError(f"Corrupt installation manifest {state.name} ({error}); remove {state.name}"
-                         " and the profile it describes, then reinstall") from error
+        value = json.loads(state.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Corrupt installation manifest {state.name} ({error})" + remedy) from error
     if not isinstance(value, dict):
-        raise ValueError(f"Corrupt installation manifest {state.name}; remove {state.name}"
-                         " and the profile it describes, then reinstall")
+        raise ValueError(f"Corrupt installation manifest {state.name}" + remedy)
+    # Every manifest this installer wrote has these fields; one without them proves no ownership.
     for field in ("profile_root", "file", "input", "output"):
         if not isinstance(value.get(field), str) or not value[field].strip():
-            raise ValueError(f"Installation manifest field {field!r} must be a nonempty string")
+            raise ValueError(f"Installation manifest field {field!r} must be a nonempty string" + remedy)
     if type(value.get("version")) is not int:
-        raise ValueError("Installation manifest field 'version' must be an integer")
-    if (not isinstance(value.get("endpoints"), list)
-            or any(not isinstance(row, dict) or not set(ENDPOINT_KEYS) <= row.keys() for row in value["endpoints"])):
-        raise ValueError("Installation manifest field 'endpoints' must be a list of endpoint objects with keys "
-                         + ", ".join(ENDPOINT_KEYS))
+        raise ValueError("Installation manifest field 'version' must be an integer" + remedy)
+    if not isinstance(value.get("endpoints"), list) or any(not isinstance(row, dict) for row in value["endpoints"]):
+        raise ValueError("Installation manifest field 'endpoints' must be a list of endpoint objects" + remedy)
     if not isinstance(value.get("sha256"), str) or not re.fullmatch("[0-9a-f]{64}", value["sha256"]):
-        raise ValueError("Installation manifest field 'sha256' must be 64 lowercase hex characters")
-    if value["version"] != 1 or value["profile_root"] != str(root):
-        raise ValueError("Installation manifest version/root mismatch")
+        raise ValueError("Installation manifest field 'sha256' must be 64 lowercase hex characters" + remedy)
+    if value["version"] != 1:
+        raise ValueError(f"Installation manifest {state.name} has version {value['version']};"
+                         " use the mainstage-mcp release that wrote it")
+    if value["profile_root"] != str(root):
+        raise ValueError(f"Installation manifest {state.name} is for profile root {value['profile_root']};"
+                         " pass that path as --profile-root")
     target = safe_path(value["file"])
     if target.parent.parent.parent != root or target.name != "config.lua" or not target.parent.name.endswith(".device"):
         raise ValueError("Manifest points outside its owned profile")
@@ -245,7 +248,7 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
         if old:
             if not target.is_file() or digest(target.read_bytes()) != old["sha256"]:
                 raise ValueError("Owned profile was changed or removed; refusing overwrite")
-            if identity(before) != old["endpoints"]:
+            if identity(before) != identity(old["endpoints"]):
                 raise ValueError("MIDI endpoint identity changed since installation")
             return {"installed": True, "changed": False, "file": str(target),
                     "experimental_actions": experimental_actions,
@@ -324,7 +327,7 @@ def doctor(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output",
                 result["issues"].append("Owned profile is missing or modified")
             if (manifest["input"], manifest["output"]) != (input_name, output_name):
                 result["issues"].append("Requested buses differ from installed profile")
-            if identity(rows) != manifest["endpoints"]:
+            if identity(rows) != identity(manifest["endpoints"]):
                 result["issues"].append("MIDI endpoint identities changed since installation")
         device_names = {row["device_name"] for row in rows if row.get("name") in (input_name, output_name)}
         owned = Path(manifest["file"]) if manifest else None

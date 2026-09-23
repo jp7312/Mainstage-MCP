@@ -196,33 +196,72 @@ class InstallationTests(unittest.TestCase):
 
     def test_corrupt_manifest_error_names_file_for_both_commands(self):
         self.state.parent.mkdir(parents=True)
-        self.state.write_text("{not json")
-        with self.assertRaisesRegex(ValueError, "installation.json"):
-            setup.uninstall(self.state, self.root)
-        for command, argv in (
-                ("install", ["install", "--bridge", str(self.options["bridge"]), "--profile-root", str(self.root),
-                             "--state", str(self.state), "--template", str(self.template)]),
-                ("uninstall", ["uninstall", "--profile-root", str(self.root), "--state", str(self.state)])):
-            with self.subTest(command=command):
-                buffer = io.StringIO()
-                with redirect_stdout(buffer):
-                    self.assertEqual(setup.main(argv), 1)
-                self.assertIn("installation.json", buffer.getvalue())
-                self.assertIn("remove", buffer.getvalue())
+        for content in (b"{not json", b'{"file": "\xff"}'):
+            self.state.write_bytes(content)
+            with self.assertRaisesRegex(ValueError, "installation.json.*remove installation.json"):
+                setup.uninstall(self.state, self.root)
+            for command, argv in (
+                    ("install", ["install", "--bridge", str(self.options["bridge"]), "--profile-root", str(self.root),
+                                 "--state", str(self.state), "--template", str(self.template)]),
+                    ("uninstall", ["uninstall", "--profile-root", str(self.root), "--state", str(self.state)])):
+                with self.subTest(command=command, content=content):
+                    buffer = io.StringIO()
+                    with redirect_stdout(buffer):
+                        self.assertEqual(setup.main(argv), 1)
+                    self.assertIn("installation.json", buffer.getvalue())
+                    self.assertIn("remove", buffer.getvalue())
 
-    def test_manifest_schema_violations_name_the_field(self):
-        setup.install(**self.options)
+    def test_manifest_schema_violations_name_the_field_and_remedy(self):
+        target = Path(setup.install(**self.options)["file"])
         good = json.loads(self.state.read_text())
         cases = [(field, {key: value for key, value in good.items() if key != field})
                  for field in ("version", "profile_root", "file", "input", "output", "endpoints", "sha256")]
         cases += [("input", {**good, "input": "  "}), ("sha256", {**good, "sha256": good["sha256"].upper()}),
-                  ("endpoints", {**good, "endpoints": [{"direction": "source"}]}),
+                  ("endpoints", {**good, "endpoints": ["source"]}), ("endpoints", {**good, "endpoints": {}}),
                   ("version", {**good, "version": True}), ("installation.json", "{")]
-        for expected, manifest in cases:
-            with self.subTest(expected=expected):
-                self.state.write_text(manifest if isinstance(manifest, str) else json.dumps(manifest))
-                with self.assertRaisesRegex(ValueError, expected):
+        for case, (expected, manifest) in enumerate(cases):
+            with self.subTest(case=case, expected=expected):
+                text = manifest if isinstance(manifest, str) else json.dumps(manifest)
+                self.state.write_text(text)
+                with self.assertRaisesRegex(ValueError, expected + ".*remove installation.json .*reinstall"):
                     setup.uninstall(self.state, self.root)
+                # A manifest this installer never wrote proves nothing, so nothing is deleted on its word.
+                self.assertTrue(target.is_file())
+                self.assertEqual(self.state.read_text(), text)
+
+    def test_endpoint_keys_added_or_dropped_later_keep_manifest_usable(self):
+        target = Path(setup.install(**self.options)["file"])
+        manifest = json.loads(self.state.read_text())
+        for row in manifest["endpoints"]:
+            row["retired_key"] = "recorded by another version"
+        self.state.write_text(json.dumps(manifest))
+        options = {key: value for key, value in self.options.items() if key != "template"}
+        self.assertFalse(setup.install(**self.options)["changed"])
+        self.assertNotIn("MIDI endpoint identities changed since installation", setup.doctor(**options)["issues"])
+        with patch.object(setup, "ENDPOINT_KEYS", setup.ENDPOINT_KEYS + ("future_key",)):
+            # Unrecorded keys compare as None, like keys the bridge omits: equal until the bridge reports a value.
+            self.assertFalse(setup.install(**self.options)["changed"])
+            listing = rows()
+            for row in listing:
+                row["future_key"] = 7
+            self.listing.return_value = listing
+            with self.assertRaisesRegex(ValueError, "identity changed"):
+                setup.install(**self.options)
+            self.assertIn("MIDI endpoint identities changed since installation", setup.doctor(**options)["issues"])
+            self.assertTrue(setup.uninstall(self.state, self.root)["changed"])
+        self.assertFalse(target.exists())
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_manifest_for_another_root_or_version_names_the_way_out(self):
+        setup.install(**self.options)
+        other = self.base / "other-profiles"
+        with self.assertRaisesRegex(ValueError, "installation.json is for profile root " + re.escape(str(self.root))
+                                    + "; pass that path as --profile-root"):
+            setup.uninstall(self.state, other)
+        manifest = json.loads(self.state.read_text())
+        self.state.write_text(json.dumps({**manifest, "version": 2}))
+        with self.assertRaisesRegex(ValueError, "installation.json has version 2; use the mainstage-mcp release"):
+            setup.uninstall(self.state, self.root)
 
     def test_lock_file_permissions_are_tightened(self):
         self.state.parent.mkdir(parents=True)
