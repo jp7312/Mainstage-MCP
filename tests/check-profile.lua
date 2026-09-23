@@ -1,4 +1,5 @@
 -- Run from package root: lua tests/check-profile.lua (Lua 5.1 or later)
+print('profile harness: ' .. _VERSION)
 -- Lua 5.1 reads patterns as NUL-terminated C strings, so a NUL byte breaks the pattern there
 -- while newer Luas accept it; reject any such pattern up front, method calls included.
 local plainFind = string.find
