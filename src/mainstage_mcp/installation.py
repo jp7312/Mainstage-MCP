@@ -20,6 +20,8 @@ SYSTEM_PROFILE_ROOTS = (Path("/Library/Audio/MIDI Device Profiles"),
 # Object handles can change between processes; persistent MIDI IDs cannot.
 ENDPOINT_KEYS = ("direction", "name", "unique_id", "entity_unique_id", "device_unique_id", "device_name",
                  "manufacturer", "model", "driver_owner")
+# Exactly the names tempfile.mkstemp gives write_exclusive's temporary files.
+TEMPORARY = re.compile(r"\.mainstage-mcp-[a-z0-9_]{8}")
 
 
 def safe_path(value):
@@ -60,6 +62,11 @@ def write_exclusive(path, data):
         os.link(temporary, path)
     finally:
         os.unlink(temporary)
+
+
+def temporaries(directory):
+    return [path for path in directory.iterdir()
+            if TEMPORARY.fullmatch(path.name) and not path.is_symlink() and path.is_file()]
 
 
 def endpoints(bridge):
@@ -220,6 +227,33 @@ def conflicts(root, manufacturer, model, owned=None, device_names=()):
     return sorted(found)
 
 
+def pending(state):
+    """Install journals its manifest here before touching the profile root, proving what an interrupted run made."""
+    journal = safe_path(str(state) + ".pending")
+    if journal.exists() and state.exists():
+        journal.unlink()  # The manifest was published; its journal is spent.
+    return journal
+
+
+def remove(record, root):
+    """Delete a recorded profile, our temporary files beside it and the record; keep and return a changed file."""
+    manifest = read_manifest(record, root)
+    target = safe_path(manifest["file"])
+    if target.exists() and (not target.is_file() or digest(target.read_bytes()) != manifest["sha256"]):
+        return str(target)
+    if target.parent.is_dir():
+        for path in temporaries(target.parent):
+            path.unlink()
+    if target.exists():
+        target.unlink()
+    for directory in (target.parent, target.parent.parent):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    record.unlink()
+
+
 def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output", profile_root=PROFILE_ROOT,
             state=STATE, template=None, experimental_actions=False, experimental_mapped_parameter=False):
     root, state = safe_path(profile_root), safe_path(state)
@@ -227,6 +261,12 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
         before = endpoints(bridge)
         manufacturer, model = select_device(before, input_name, output_name)
         target = safe_path(root / manufacturer / (model + ".device") / "config.lua")
+        journal = pending(state)
+        if journal.exists():
+            preserved = remove(journal, root)
+            if preserved:
+                raise ValueError(f"Interrupted installation left changed file {preserved};"
+                                 " inspect it and remove it if unneeded, then reinstall")
         old = read_manifest(state, root)
         if old and (old["file"] != str(target) or old["input"] != input_name or old["output"] != output_name
                     or bool(old.get("experimental_actions")) != experimental_actions
@@ -238,13 +278,18 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
             template = template or files("mainstage_mcp").joinpath("profile.lua")
             data = render(template, input_name, output_name, manufacturer, model,
                           experimental_actions, experimental_mapped_parameter)
-            # A crash between publishing config.lua and the manifest leaves our own bytes behind; adopt them.
+            # Versions before the journal could crash between publishing config.lua and the manifest,
+            # leaving our own bytes behind; adopt them.
             orphan = target.is_file() and target.read_bytes() == data
             if target.exists() and not orphan:
                 raise ValueError("Conflicting profile file: " + str(target))
         conflicting = conflicts(root, manufacturer, model, target if (old or orphan) else None, device_names)
         if conflicting:
-            raise ValueError("Conflicting profile files: " + ", ".join(conflicting))
+            hint = ""
+            if not old and target.parent.is_dir() and set(target.parent.iterdir()) <= set(temporaries(target.parent)):
+                hint = (f"; {target.parent.name} holds no profile, only what an interrupted install leaves behind:"
+                        " remove it if you did not create it, then reinstall")
+            raise ValueError("Conflicting profile files: " + ", ".join(conflicting) + hint)
         if old:
             if not target.is_file() or digest(target.read_bytes()) != old["sha256"]:
                 raise ValueError("Owned profile was changed or removed; refusing overwrite")
@@ -258,31 +303,29 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
                     "experimental_actions": experimental_actions,
                     "experimental_mapped_parameter": experimental_mapped_parameter,
                     "endpoints": identity(before), "bridge": str(Path(bridge).expanduser().resolve())}
-        created = False
-        state_created = False
+        encoded = (json.dumps(manifest, indent=2) + "\n").encode()
+        journaled = made = state_created = False
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
             if not orphan:
+                write_exclusive(journal, encoded)
+                journaled = True
+                target.parent.mkdir(parents=True)
+                made = True
                 write_exclusive(target, data)
-                created = True
             if identity(endpoints(bridge)) != identity(before):
                 raise ValueError("MIDI identities changed during installation; profile rolled back")
-            write_exclusive(state, (json.dumps(manifest, indent=2) + "\n").encode())
+            write_exclusive(state, encoded)
             state_created = True
         except BaseException:
             if state_created:
                 state.unlink()
-            if created and target.is_file() and digest(target.read_bytes()) == digest(data):
-                target.unlink()
-                try:
-                    target.parent.rmdir()
-                except OSError:
-                    pass
-            try:
-                target.parent.parent.rmdir()
-            except OSError:
-                pass
+            if made:
+                remove(journal, root)
+            elif journaled:
+                journal.unlink()
             raise
+        if journaled:
+            journal.unlink()
         return {"installed": True, "changed": True, "file": str(target),
                 "experimental_actions": experimental_actions,
                 "experimental_mapped_parameter": experimental_mapped_parameter,
@@ -292,20 +335,14 @@ def install(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output"
 def uninstall(state=STATE, profile_root=PROFILE_ROOT):
     state, root = safe_path(state), safe_path(profile_root)
     with locked(state):
-        manifest = read_manifest(state, root)
-        if not manifest:
+        # Without a manifest, an interrupted install's journal is the record to roll back.
+        journal = pending(state)
+        record = state if state.exists() else journal
+        if not record.exists():
             return {"uninstalled": True, "changed": False}
-        target = safe_path(manifest["file"])
-        if target.exists():
-            if not target.is_file() or digest(target.read_bytes()) != manifest["sha256"]:
-                return {"uninstalled": False, "preserved_changed_file": str(target)}
-            target.unlink()
-        state.unlink()
-        for directory in (target.parent, target.parent.parent):
-            try:
-                directory.rmdir()
-            except OSError:
-                pass
+        preserved = remove(record, root)
+        if preserved:
+            return {"uninstalled": False, "preserved_changed_file": preserved}
         return {"uninstalled": True, "changed": True}
 
 
@@ -321,6 +358,9 @@ def doctor(bridge, input_name="MS Bridge Input", output_name="MS Bridge Output",
         manifest = read_manifest(state, profile_root)
         if not manifest:
             result["issues"].append("Profile is not installed by this installer")
+            if safe_path(str(state) + ".pending").exists():
+                result["issues"].append("An installation was interrupted before it was recorded;"
+                                        " run uninstall to roll back what it made")
         else:
             target = safe_path(manifest["file"])
             if not target.is_file() or digest(target.read_bytes()) != manifest["sha256"]:

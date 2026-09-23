@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import multiprocessing
+import os
 import re
 import shutil
 import tempfile
@@ -23,6 +24,52 @@ def hold_lock(state, connection):
         connection.send(repr(error))
     finally:
         connection.close()
+
+
+def crash_install(options, step):
+    """Install in a child that dies like a killed process at `step`, leaving that step's disk state behind."""
+    target = Path(options["profile_root"]) / "Apple Inc/Sterownik IAC.device/config.lua"
+    write, link, unlink, make = setup.write_exclusive, os.link, os.unlink, Path.mkdir
+
+    def mkdir_or_die(after):
+        def mkdir(self, *args, **kwargs):
+            if self == target.parent and not after:
+                os._exit(17)
+            make(self, *args, **kwargs)
+            if self == target.parent:
+                os._exit(17)
+        return mkdir
+
+    def die_writing(path):
+        def write_or_die(destination, data):
+            if destination == path:
+                os._exit(17)
+            write(destination, data)
+        return write_or_die
+
+    def link_or_die(source, destination):  # our temporary file is complete but not yet published
+        if Path(destination) == target:
+            os._exit(17)
+        link(source, destination)
+
+    def unlink_or_die(path):  # config.lua is published beside our not yet removed temporary file
+        if Path(path).parent == target.parent:
+            os._exit(17)
+        unlink(path)
+
+    def unlink_journal_or_die(path):  # the manifest is published, its journal not yet removed
+        if Path(path) == Path(str(options["state"]) + ".pending"):
+            os._exit(17)
+        unlink(path)
+
+    module, name, replacement = {"journaled": (Path, "mkdir", mkdir_or_die(after=False)),
+                                 "directory": (Path, "mkdir", mkdir_or_die(after=True)),
+                                 "temporary": (os, "link", link_or_die),
+                                 "published": (os, "unlink", unlink_or_die),
+                                 "manifest": (setup, "write_exclusive", die_writing(Path(options["state"]))),
+                                 "committed": (os, "unlink", unlink_journal_or_die)}[step]
+    with patch.object(setup, "endpoints", return_value=rows()), patch.object(module, name, replacement):
+        setup.install(**options)
 
 
 def rows():
@@ -173,6 +220,35 @@ class InstallationTests(unittest.TestCase):
         self.assertFalse(self.state.exists())
         self.assertEqual(list(self.root.iterdir()), [])
 
+    def test_profile_write_failure_leaves_no_directory_behind(self):
+        write = setup.write_exclusive
+
+        def fail_profile(path, data):
+            if path.name == "config.lua":
+                raise OSError("disk full")
+            write(path, data)
+        with patch.object(setup, "write_exclusive", side_effect=fail_profile):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                setup.install(**self.options)
+        self.assertEqual(list(self.root.iterdir()), [])
+        self.assertEqual([path.name for path in self.state.parent.iterdir()], ["installation.json.lock"])
+        self.assertTrue(setup.install(**self.options)["changed"])
+
+    def test_profile_directory_appearing_mid_install_is_not_taken_over(self):
+        directory = self.root / "Apple Inc/Sterownik IAC.device"
+        scan = setup.conflicts
+
+        def scan_then_race(*args):
+            found = scan(*args)
+            directory.mkdir(parents=True)  # someone else creates it between the scan and our mkdir
+            return found
+        with patch.object(setup, "conflicts", side_effect=scan_then_race):
+            with self.assertRaises(FileExistsError):
+                setup.install(**self.options)
+        self.assertEqual(list(directory.iterdir()), [])
+        self.assertFalse(self.state.exists())
+        self.assertEqual([path.name for path in self.state.parent.iterdir()], ["installation.json.lock"])
+
     def test_crash_orphan_with_identical_bytes_is_adopted(self):
         manufacturer, model = setup.select_device(rows(), "MS Bridge Input", "MS Bridge Output")
         target = self.root / manufacturer / (model + ".device") / "config.lua"
@@ -251,6 +327,105 @@ class InstallationTests(unittest.TestCase):
             self.assertTrue(setup.uninstall(self.state, self.root)["changed"])
         self.assertFalse(target.exists())
         self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_crash_residue_is_rolled_back_by_install_or_uninstall(self):
+        context = multiprocessing.get_context("spawn")
+        directory = self.root / "Apple Inc/Sterownik IAC.device"
+        options = {key: value for key, value in self.options.items() if key != "template"}
+        for step, residue in (("journaled", None), ("directory", []), ("temporary", ["<temporary>"]),
+                              ("published", ["<temporary>", "config.lua"]), ("manifest", ["config.lua"])):
+            for recovery in ("install", "uninstall"):
+                with self.subTest(step=step, recovery=recovery):
+                    self.reset()
+                    child = context.Process(target=crash_install, args=(self.options, step))
+                    child.start()
+                    child.join(60)
+                    self.assertEqual(child.exitcode, 17)
+                    self.assertFalse(self.state.exists())
+                    self.assertEqual(directory.exists() and sorted(
+                        re.sub(r"^\.mainstage-mcp-.*", "<temporary>", path.name) for path in directory.iterdir()),
+                                     residue if residue is not None else False)
+                    issues = setup.doctor(**options)["issues"]
+                    if recovery == "install":
+                        self.assertTrue(setup.install(**self.options)["changed"])
+                        self.assertEqual([path.name for path in directory.iterdir()], ["config.lua"])
+                        self.assertEqual(json.loads(self.state.read_text())["sha256"],
+                                         setup.digest((directory / "config.lua").read_bytes()))
+                        self.assertFalse(setup.install(**self.options)["changed"])
+                    self.assertTrue(setup.uninstall(self.state, self.root)["changed"])
+                    self.assertFalse(self.root.exists() and list(self.root.iterdir()))
+                    self.assertEqual([path.name for path in self.state.parent.iterdir()], ["installation.json.lock"])
+                    self.assertTrue(any("interrupted" in issue for issue in issues), issues)
+
+    def test_crash_after_manifest_publish_leaves_working_installation(self):
+        journal = Path(str(self.state) + ".pending")
+        options = {key: value for key, value in self.options.items() if key != "template"}
+        for command in ("install", "uninstall"):
+            with self.subTest(command=command):
+                self.reset()
+                child = multiprocessing.get_context("spawn").Process(target=crash_install,
+                                                                     args=(self.options, "committed"))
+                child.start()
+                child.join(60)
+                self.assertEqual(child.exitcode, 17)
+                self.assertTrue(self.state.exists() and journal.exists())
+                self.assertFalse(any("interrupted" in issue for issue in setup.doctor(**options)["issues"]))
+                if command == "install":
+                    self.assertFalse(setup.install(**self.options)["changed"])
+                    self.assertFalse(journal.exists())
+                self.assertTrue(setup.uninstall(self.state, self.root)["changed"])
+                self.assertEqual(list(self.root.iterdir()), [])
+                self.assertEqual([path.name for path in self.state.parent.iterdir()], ["installation.json.lock"])
+
+    def test_crash_recovery_leaves_foreign_files_alone(self):
+        directory = self.root / "Apple Inc/Sterownik IAC.device"
+        outside = self.base / "outside.txt"
+        outside.write_text("keep")
+        foreign = [directory / "notes.txt", directory / ".mainstage-mcp-note", directory / ".mainstage-mcp-ABCDEFGH",
+                   directory / ".mainstage-mcp-abcdefgh.lua", directory.parent / ".mainstage-mcp-abcdefgh",
+                   self.root / "Apple Inc/Sterownik IAC..device/.mainstage-mcp-abcdefgh"]
+        kept = {".mainstage-mcp-linkxxxx", ".mainstage-mcp-dirxxxxx", *(path.name for path in foreign[:4])}
+        for command in ("install", "uninstall"):
+            with self.subTest(command=command):
+                self.reset()
+                child = multiprocessing.get_context("spawn").Process(target=crash_install,
+                                                                     args=(self.options, "published"))
+                child.start()
+                child.join(60)
+                self.assertEqual(child.exitcode, 17)
+                self.assertIn("config.lua", [path.name for path in directory.iterdir()])
+                for path in foreign:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"foreign")
+                (directory / ".mainstage-mcp-linkxxxx").symlink_to(outside)
+                (directory / ".mainstage-mcp-dirxxxxx").mkdir()
+                if command == "install":
+                    with self.assertRaisesRegex(ValueError, "Conflicting"):
+                        setup.install(**self.options)
+                else:
+                    self.assertTrue(setup.uninstall(self.state, self.root)["changed"])
+                # Only our hash-matched config.lua and exactly named temporary file were removed.
+                self.assertEqual({path.name for path in directory.iterdir()}, kept)
+                self.assertTrue(all(path.read_bytes() == b"foreign" for path in foreign))
+                self.assertTrue((directory / ".mainstage-mcp-linkxxxx").is_symlink())
+                self.assertTrue((directory / ".mainstage-mcp-dirxxxxx").is_dir())
+                self.assertEqual(outside.read_text(), "keep")
+                self.assertFalse(self.state.exists())
+                self.assertFalse(setup.uninstall(self.state, self.root)["changed"])
+
+    def test_unproven_empty_profile_directory_gets_actionable_error(self):
+        directory = self.root / "Apple Inc/Sterownik IAC.device"
+        for names in ((), (".mainstage-mcp-abcdefgh",)):
+            with self.subTest(names=names):
+                self.reset()
+                directory.mkdir(parents=True)
+                for name in names:
+                    (directory / name).write_bytes(b"partial")
+                with self.assertRaisesRegex(ValueError, r"Sterownik IAC\.device.*remove it if you did not create it"):
+                    setup.install(**self.options)
+                self.assertFalse(setup.uninstall(self.state, self.root)["changed"])
+                self.assertEqual(sorted(path.name for path in directory.iterdir()), list(names))
+                self.assertFalse(self.state.exists())
 
     def test_manifest_for_another_root_or_version_names_the_way_out(self):
         setup.install(**self.options)
