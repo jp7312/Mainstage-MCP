@@ -64,9 +64,9 @@ struct SysExParser {
         }
     }
 }
-// Decode-hex EOF edge: a capture cut off before even the MSP2 marker byte is invalid input,
-// not a partial message; truncation after 7D stays tolerable for dev inspection.
-func decodableTail(_ pending: [UInt8]?) -> Bool { pending == nil || pending?.first == 0x7D }
+// Decode-hex EOF edge: a capture cut off inside another manufacturer's frame is invalid input;
+// truncation before any data byte (F0, F0 F8) or after 7D stays tolerable for dev inspection.
+func decodableTail(_ pending: [UInt8]?) -> Bool { (pending?.first ?? 0x7D) == 0x7D }
 struct Command { let id: String; let bytes: [UInt8]; let quit: Bool }
 func token(_ value: Any?) -> String? {
     guard let text = value as? String, (1...64).contains(text.utf8.count),
@@ -265,17 +265,15 @@ func selfTest() {
     // --decode-hex tokens require exactly two hex digits.
     for (text, byte) in [("7d", UInt8(0x7D)), ("F0", UInt8(0xF0)), ("ab", UInt8(0xAB))] { precondition(hexByte(text) == byte) }
     for text in ["f", "7", "7dd", "0x7d", "+f", "-f", " f", "7d ", "", "zz"] { precondition(hexByte(text) == nil) }
-    // A capture ending before the MSP2 marker byte is rejected; 7D-prefixed truncation is not.
-    precondition(decodableTail(nil) && decodableTail([0x7D, 0x4D]))
-    precondition(!decodableTail([]) && !decodableTail([0x41, 0x06]))
-    // --decode-hex takes a maximum frame on one line.
+    // --decode-hex takes a maximum frame on one line. Captures may end mid-frame after F0 or 7D, not
+    // inside another manufacturer's frame.
     func decoded(_ text: String) -> Int? {
         var bytes = Array(text.utf8)[...], count = 0
         return decodeHex({ bytes.popFirst() }, emit: { _ in count += 1 }) ? count : nil
     }
     let maximal = replay.map { String(format: "%02X", $0) }.joined(separator: " ")
     precondition(decoded(maximal + "\r\n") == 1 && decoded(maximal + " 00") == nil)
-    for text in ["", "F0 7D", "F0 7D 4D"] { precondition(decoded(text) == 0) }
+    for text in ["", "F0", "F0 F8", "F0\nF8\n", "F0 7D", "F0 7D 4D"] { precondition(decoded(text) == 0) }
     for text in ["F0 41 06", "F0 f", "7D0"] { precondition(decoded(text) == nil) }
     // Line reader stays bounded and flags oversized lines instead of buffering past maximumLine.
     var reader = LineReader()
@@ -292,7 +290,7 @@ func selfTest() {
                                       ["name": "", "display_name": "Bus", "unique_id": Int32(0)],
                                       ["name": "", "display_name": "", "unique_id": Int32(7)]]
     for info in surviving { precondition(usableRoute(info)) }
-    json(["self_test":"passed", "checks":"fragmentation, realtime, unicode, malformed input, frame bound, strict commands, correlation, timer burst backlog, hex tokens, hex frames, bounded lines, list rows"])
+    json(["self_test":"passed", "checks":"fragmentation, realtime, unicode, malformed input, frame bound, strict commands, correlation, timer burst backlog, hex tokens, hex frames and tails, bounded lines, list rows"])
 }
 
 func run() {
